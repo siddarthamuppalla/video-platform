@@ -8,9 +8,10 @@ on:
 jobs:
   server:
     runs-on: ubuntu-latest
+    # Service images come from Google's Docker Hub mirror; anonymous Docker Hub pulls on shared runners hit rate limits.
     services:
       postgres:
-        image: postgres:16-alpine
+        image: mirror.gcr.io/library/postgres:16-alpine
         env:
           POSTGRES_USER: reel
           POSTGRES_PASSWORD: reel
@@ -18,7 +19,7 @@ jobs:
         ports: ["5432:5432"]
         options: --health-cmd "pg_isready -U reel" --health-interval 2s --health-retries 30
       redis:
-        image: redis:7-alpine
+        image: mirror.gcr.io/library/redis:7-alpine
         ports: ["6379:6379"]
         options: --health-cmd "redis-cli ping" --health-interval 2s --health-retries 30
     defaults:
