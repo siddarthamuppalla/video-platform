@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: reel
+      POSTGRES_PASSWORD: reel
+      POSTGRES_DB: reel
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reel"]
+      interval: 2s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 30
+
+  api:
+    build: ./server
+    environment: &server-env
+      DATABASE_URL: postgres://reel:reel@postgres:5432/reel
+      REDIS_URL: redis://redis:6379
+      STORAGE_DIR: /data
+    volumes:
+      - media:/data
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  worker:
+    build: ./server
+    command: ["node", "dist/worker.js"]
+    environment: *server-env
+    # The worker reads the reassembled source and writes HLS output into the same volume the API serves.
+    volumes:
+      - media:/data
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  media:
