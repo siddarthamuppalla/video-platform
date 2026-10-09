@@ -1,7 +1,5 @@
-import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { pipeline } from "node:stream/promises";
 import express, { Router } from "express";
 import { z } from "zod";
 import { config, paths } from "./config.js";
@@ -161,11 +159,15 @@ uploadsRouter.post("/:id/complete", async (req, res) => {
   await fsp.mkdir(videoDir, { recursive: true });
   const ext = path.extname(upload.filename).toLowerCase();
   const sourcePath = path.join(videoDir, `source${ext}`);
-  const out = fs.createWriteStream(sourcePath);
-  for (let i = 0; i < upload.total_chunks; i++) {
-    await pipeline(fs.createReadStream(paths.chunk(upload.id, i)), out, { end: false });
+  // Append chunks in index order. Each is at most chunkSize bytes, so reading one at a time keeps memory flat.
+  const out = await fsp.open(sourcePath, "w");
+  try {
+    for (let i = 0; i < upload.total_chunks; i++) {
+      await out.write(await fsp.readFile(paths.chunk(upload.id, i)));
+    }
+  } finally {
+    await out.close();
   }
-  await new Promise<void>((resolve, reject) => out.end((err?: Error | null) => (err ? reject(err) : resolve())));
 
   const { size } = await fsp.stat(sourcePath);
   if (size !== upload.size) {
