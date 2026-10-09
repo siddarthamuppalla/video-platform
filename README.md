@@ -1,6 +1,6 @@
 # Reel
 
-A small video platform built to learn how video sites actually move bytes around: chunked, resumable uploads, a background encoder that turns one file into several qualities, and a player that switches between them as your bandwidth changes.
+A small video platform built to learn how video sites actually move bytes around: chunked, resumable uploads, a background encoder that turns one file into several qualities (up to 4K), and a player that switches between them as your bandwidth changes.
 
 It has accounts, uploads, a video list with search, a watch page with a quality menu, and a page for managing your own videos. The interface follows the [Reel design system](https://claude.ai/artifact/UXsCFyB3YWA4c3Da5YwGqk).
 
@@ -71,17 +71,19 @@ For each video the worker:
 
 1. **Probes** the file with `ffprobe` to get the duration, dimensions and whether there is audio. Phone videos are often stored sideways with a rotation flag, so the width and height are swapped when the flag says 90° or 270°.
 2. **Grabs a thumbnail** 10% of the way in, which skips black intro frames more often than the first frame does.
-3. **Plans renditions** from the ladder: 1080p at 5 Mbps, 720p at 2.8 Mbps and 360p at 0.8 Mbps. It only uses rungs at or below the source height, because upscaling adds bytes without adding detail.
+3. **Plans renditions** from the ladder: 2160p at 16 Mbps, 1440p at 9 Mbps, 1080p at 5 Mbps, 720p at 2.8 Mbps and 360p at 0.8 Mbps. It only uses rungs at or below the source's resolution, because upscaling adds bytes without adding detail, so a 4K upload gets all five and a 720p upload gets two. The number is the frame's short side, so a 1080×1920 phone video counts as 1080p. Each rung pins its H.264 profile and level (High 5.2 for 2160p, down to Main 4.0 for 720p and 360p), and the master playlist advertises the same values so players know in advance whether they can decode a rendition.
 4. **Encodes each rendition** to H.264 and AAC with `ffmpeg -f hls`, which writes six-second `.ts` segments plus a playlist (`720p/index.m3u8`) listing them. Keyframes are forced every 6 seconds (`-force_key_frames expr:gte(t,n_forced*6)`), so every rendition's segments start at the same timestamps. That alignment is what lets a player jump from 720p segment 4 to 360p segment 5 without a glitch. Progress comes from ffmpeg's `-progress` output and is written to the database about once a second, weighted by each rendition's pixel count.
 5. **Writes the master playlist**, `master.m3u8`, which lists every rendition with its bandwidth and resolution:
 
    ```
    #EXTM3U
    #EXT-X-VERSION:3
-   #EXT-X-STREAM-INF:BANDWIDTH=6025800,RESOLUTION=1920x1080,CODECS="avc1.4d401f,mp4a.40.2",NAME="1080p"
+   #EXT-X-STREAM-INF:BANDWIDTH=18972800,RESOLUTION=3840x2160,CODECS="avc1.640034,mp4a.40.2",NAME="2160p"
+   2160p/index.m3u8
+   #EXT-X-STREAM-INF:BANDWIDTH=10733800,RESOLUTION=2560x1440,CODECS="avc1.640033,mp4a.40.2",NAME="1440p"
+   1440p/index.m3u8
+   #EXT-X-STREAM-INF:BANDWIDTH=6025800,RESOLUTION=1920x1080,CODECS="avc1.64002a,mp4a.40.2",NAME="1080p"
    1080p/index.m3u8
-   #EXT-X-STREAM-INF:BANDWIDTH=3436400,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2",NAME="720p"
-   720p/index.m3u8
    ...
    ```
 
@@ -92,7 +94,9 @@ data/videos/<id>/
   source.mp4          the reassembled upload (never served)
   thumbnail.jpg
   master.m3u8
-  1080p/index.m3u8  1080p/segment_0000.ts  segment_0001.ts ...
+  2160p/index.m3u8  2160p/segment_0000.ts  segment_0001.ts ...
+  1440p/...
+  1080p/...
   720p/...
   360p/...
 ```
