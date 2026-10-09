@@ -44,6 +44,13 @@ services:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
 
+  web:
+    build: ./web
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
 volumes:
   pgdata:
   media:

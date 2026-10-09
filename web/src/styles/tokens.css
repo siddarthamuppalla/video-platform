@@ -1,0 +1,84 @@
+/* Reel tokens, copied from the Reel design system (tokens.json). Edit there first. */
+:root {
+  --surface: #f6f7f9;
+  --surface-raised: #ffffff;
+  --surface-sunken: #eceef2;
+  --line: #d9dde4;
+  --line-strong: #8a93a1;
+  --ink: #14171d;
+  --ink-muted: #566070;
+  --tally: #c42d22;
+  --on-tally: #ffffff;
+  --tally-soft: #fbe4e1;
+  --success: #17704a;
+  --warning: #8a5a00;
+  --danger: #a3171f;
+  --focus: #1f5fd6;
+  --scrim: rgba(10, 11, 14, 0.78);
+  --shadow-pop: 0 8px 24px rgba(20, 23, 29, 0.14);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --surface: #111318;
+    --surface-raised: #1a1d24;
+    --surface-sunken: #0a0b0e;
+    --line: #2b303a;
+    --line-strong: #6b7482;
+    --ink: #eceef2;
+    --ink-muted: #9ba3b0;
+    --tally: #ff6b5d;
+    --on-tally: #1c0604;
+    --tally-soft: #3b1613;
+    --success: #5cc996;
+    --warning: #e8b04a;
+    --danger: #ff8a8a;
+    --focus: #80aaff;
+    --scrim: rgba(0, 0, 0, 0.78);
+    --shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.55);
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --surface: #111318;
+  --surface-raised: #1a1d24;
+  --surface-sunken: #0a0b0e;
+  --line: #2b303a;
+  --line-strong: #6b7482;
+  --ink: #eceef2;
+  --ink-muted: #9ba3b0;
+  --tally: #ff6b5d;
+  --on-tally: #1c0604;
+  --tally-soft: #3b1613;
+  --success: #5cc996;
+  --warning: #e8b04a;
+  --danger: #ff8a8a;
+  --focus: #80aaff;
+  --scrim: rgba(0, 0, 0, 0.78);
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.55);
+  color-scheme: dark;
+}
+
+:root {
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-pill: 999px;
+  --font-sans: "Schibsted Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+}
+
+.type-display { font-family: var(--font-sans); font-size: 32px; line-height: 38px; font-weight: 700; letter-spacing: -0.02em; }
+.type-title { font-family: var(--font-sans); font-size: 20px; line-height: 28px; font-weight: 600; }
+.type-heading { font-family: var(--font-sans); font-size: 15px; line-height: 21px; font-weight: 600; }
+.type-body { font-family: var(--font-sans); font-size: 15px; line-height: 22px; font-weight: 400; }
+.type-small { font-family: var(--font-sans); font-size: 13px; line-height: 18px; font-weight: 400; }
+.type-label { font-family: var(--font-sans); font-size: 12px; line-height: 16px; font-weight: 600; letter-spacing: 0.04em; }
+.type-timecode { font-family: var(--font-mono); font-size: 12px; line-height: 16px; font-weight: 500; }
