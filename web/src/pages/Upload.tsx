@@ -185,7 +185,7 @@ export function Upload() {
                 ? "Encoding finished. Your video is live."
                 : phase.video?.status === "failed"
                   ? phase.video.error ?? "Encoding failed."
-                  : "Upload complete. The encoder is making 1080p, 720p and 360p versions."}
+                  : "Upload complete. The encoder is making a version for each quality up to your video's own resolution."}
             </span>
             {phase.video?.status === "ready" ? (
               <Link className="rl-btn rl-btn--primary rl-btn--sm" to={`/watch/${phase.videoId}`}>

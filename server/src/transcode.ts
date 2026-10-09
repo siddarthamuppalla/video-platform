@@ -3,14 +3,19 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 
 export type Probe = { durationSeconds: number; width: number; height: number; hasAudio: boolean };
-export type Rung = { name: string; height: number; videoKbps: number };
-export type PlannedRendition = { name: string; width: number; height: number; videoKbps: number };
+export type Rung = { name: string; height: number; videoKbps: number; profile: "main" | "high"; level: string; codec: string };
+export type PlannedRendition = Rung & { width: number };
 
-/** The bitrate ladder. Each source is encoded once per rung at or below its own height. */
+/**
+ * The bitrate ladder, highest first. Each source is encoded once per rung at or below its own size.
+ * Profile and level are pinned per rung so the CODECS string in the master playlist matches the stream.
+ */
 export const LADDER: Rung[] = [
-  { name: "1080p", height: 1080, videoKbps: 5000 },
-  { name: "720p", height: 720, videoKbps: 2800 },
-  { name: "360p", height: 360, videoKbps: 800 },
+  { name: "2160p", height: 2160, videoKbps: 16000, profile: "high", level: "5.2", codec: "avc1.640034" },
+  { name: "1440p", height: 1440, videoKbps: 9000, profile: "high", level: "5.1", codec: "avc1.640033" },
+  { name: "1080p", height: 1080, videoKbps: 5000, profile: "high", level: "4.2", codec: "avc1.64002a" },
+  { name: "720p", height: 720, videoKbps: 2800, profile: "main", level: "4.0", codec: "avc1.4d4028" },
+  { name: "360p", height: 360, videoKbps: 800, profile: "main", level: "4.0", codec: "avc1.4d4028" },
 ];
 export const AUDIO_KBPS = 128;
 /** Segment length in seconds. Every rendition cuts at the same timestamps, so players can switch at any boundary. */
@@ -18,13 +23,20 @@ export const SEGMENT_SECONDS = 6;
 
 const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
 
-/** Never upscale: pick rungs no taller than the source, or one rung at the source's own size if it is tiny. */
+/**
+ * Never upscale: pick rungs no larger than the source, or one rung at the source's own size if it is tiny.
+ * A rung's number is the frame's short side, as on other video sites, so a 1080x1920 phone video is "1080p".
+ */
 export function planRenditions(srcWidth: number, srcHeight: number): PlannedRendition[] {
-  const fit = (r: Rung, h: number) => ({ name: r.name, height: even(h), width: even((srcWidth * h) / srcHeight), videoKbps: r.videoKbps });
-  const rungs = LADDER.filter((r) => r.height <= srcHeight).map((r) => fit(r, r.height));
+  const short = Math.min(srcWidth, srcHeight);
+  const fit = (r: Rung, side: number): PlannedRendition => {
+    const scale = side / short;
+    return { ...r, width: even(srcWidth * scale), height: even(srcHeight * scale) };
+  };
+  const rungs = LADDER.filter((r) => r.height <= short).map((r) => fit(r, r.height));
   if (rungs.length > 0) return rungs;
   const smallest = LADDER[LADDER.length - 1];
-  return [{ ...fit(smallest, srcHeight), name: `${even(srcHeight)}p` }];
+  return [{ ...fit(smallest, short), name: `${even(short)}p` }];
 }
 
 export function bandwidthFor(r: { videoKbps: number }, hasAudio: boolean) {
@@ -34,9 +46,9 @@ export function bandwidthFor(r: { videoKbps: number }, hasAudio: boolean) {
 
 /** The master playlist is the entry point a player loads: one line per rendition, which it picks between by bandwidth. */
 export function masterPlaylist(renditions: PlannedRendition[], hasAudio: boolean) {
-  const codecs = hasAudio ? "avc1.4d401f,mp4a.40.2" : "avc1.4d401f";
   const lines = ["#EXTM3U", "#EXT-X-VERSION:3"];
   for (const r of renditions) {
+    const codecs = hasAudio ? `${r.codec},mp4a.40.2` : r.codec;
     lines.push(
       `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidthFor(r, hasAudio)},RESOLUTION=${r.width}x${r.height},CODECS="${codecs}",NAME="${r.name}"`,
       `${r.name}/index.m3u8`,
@@ -100,7 +112,7 @@ export async function encodeRendition(
     "-i", source,
     "-map", "0:v:0", ...(src.hasAudio ? ["-map", "0:a:0"] : []),
     "-vf", `scale=${r.width}:${r.height}`,
-    "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "main", "-pix_fmt", "yuv420p",
+    "-c:v", "libx264", "-preset", "veryfast", "-profile:v", r.profile, "-level:v", r.level, "-pix_fmt", "yuv420p",
     "-b:v", `${r.videoKbps}k`, "-maxrate", `${Math.round(r.videoKbps * 1.07)}k`, "-bufsize", `${r.videoKbps * 2}k`,
     // A keyframe exactly every SEGMENT_SECONDS lines segment boundaries up across renditions.
     "-force_key_frames", `expr:gte(t,n_forced*${SEGMENT_SECONDS})`, "-sc_threshold", "0",
