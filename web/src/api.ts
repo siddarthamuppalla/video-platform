@@ -16,6 +16,8 @@ export type Video = {
   views: number;
   createdAt: string;
   owner: { id: string; username: string };
+  /** True once the smallest rendition is encoded; larger ones may still be on the way. */
+  playable: boolean;
   thumbnailUrl: string | null;
   hlsUrl: string | null;
 };

@@ -45,8 +45,8 @@ sequenceDiagram
   A->>A: stitch chunks into source file
   A->>Q: enqueue transcode job
   W->>Q: take job
-  W->>W: ffprobe, thumbnail, encode each rendition
-  W->>D: progress, then status = ready
+  W->>W: ffprobe, thumbnail, encode 360p first and the rest alongside
+  W->>D: publish 360p (now playable), progress, then status = ready
   B->>A: GET /media/:id/master.m3u8, then segments
 ```
 
@@ -72,8 +72,12 @@ For each video the worker:
 1. **Probes** the file with `ffprobe` to get the duration, dimensions and whether there is audio. Phone videos are often stored sideways with a rotation flag, so the width and height are swapped when the flag says 90° or 270°.
 2. **Grabs a thumbnail** 10% of the way in, which skips black intro frames more often than the first frame does.
 3. **Plans renditions** from the ladder: 2160p at 16 Mbps, 1440p at 9 Mbps, 1080p at 5 Mbps, 720p at 2.8 Mbps and 360p at 0.8 Mbps. It only uses rungs at or below the source's resolution, because upscaling adds bytes without adding detail, so a 4K upload gets all five and a 720p upload gets two. The number is the frame's short side, so a 1080×1920 phone video counts as 1080p. Each rung pins its H.264 profile and level (High 5.2 for 2160p, down to Main 4.0 for 720p and 360p), and the master playlist advertises the same values so players know in advance whether they can decode a rendition.
-4. **Encodes each rendition** to H.264 and AAC with `ffmpeg -f hls`, which writes six-second `.ts` segments plus a playlist (`720p/index.m3u8`) listing them. Keyframes are forced every 6 seconds (`-force_key_frames expr:gte(t,n_forced*6)`), so every rendition's segments start at the same timestamps. That alignment is what lets a player jump from 720p segment 4 to 360p segment 5 without a glitch. Progress comes from ffmpeg's `-progress` output and is written to the database about once a second, weighted by each rendition's pixel count.
-5. **Writes the master playlist**, `master.m3u8`, which lists every rendition with its bandwidth and resolution:
+4. **Encodes the renditions, smallest first**, to H.264 and AAC with `ffmpeg -f hls`, which writes six-second `.ts` segments plus a playlist (`720p/index.m3u8`) listing them. Two ffmpeg processes start at once:
+   - the **smallest rendition** (usually 360p) on its own, at normal CPU priority;
+   - **every other rendition in a single ffmpeg run** at a lower priority (`nice -n 10`). That run decodes the source once and splits the frames into one scaler and encoder per rendition (`-filter_complex "[0:v]split=4[in0]...;[in0]scale=1280:720[out0];..."`), instead of decoding the whole source again for each quality.
+
+   Because of the priority difference the 360p encode gets the cores first and finishes almost as fast as it would alone, while the big run soaks up whatever CPU is left, so nothing sits idle. Keyframes are forced every 6 seconds (`-force_key_frames expr:gte(t,n_forced*6)`) in every output, so every rendition's segments start at the same timestamps. That alignment is what lets a player jump from 720p segment 4 to 360p segment 5 without a glitch. Progress comes from ffmpeg's `-progress` output and is written to the database about once a second, weighted by each rendition's pixel count. If one process fails, the other is stopped.
+5. **Publishes each rendition as soon as it is done.** The worker rewrites the master playlist, `master.m3u8`, to list every finished rendition (writing a temp file and renaming it, so a player never reads half a playlist) and saves the list in the `renditions` column. The first publish makes the video **playable**: it appears on the home page and can be watched in 360p while the larger qualities are still encoding. When the last rendition lands the status becomes `ready`. A finished master playlist looks like this:
 
    ```
    #EXTM3U
@@ -86,6 +90,26 @@ For each video the worker:
    1080p/index.m3u8
    ...
    ```
+
+If the job fails and is retried, renditions that were already published are kept and not encoded again, so the video stays watchable during the retry. If the last attempt fails after 360p was published, the video stays up with the qualities it has, and the error is kept for its owner.
+
+#### Why this encoding strategy
+
+Before this, each rendition was encoded by its own ffmpeg process, largest first, and a video could only be watched once all of them were done. `server/bench/encode-strategies.mjs` times the alternatives with the same encoder settings (x264 `veryfast`, same bitrates and keyframes), on a 4-core machine:
+
+| Strategy | 1080p clip, 76 s: playable / all done | 1080p clip, 33 s | 4K clip, 33 s |
+|---|---|---|---|
+| Before: one process per rendition, largest first | 75 s / 75 s | 26 s / 26 s | 155 s / 155 s |
+| Same, smallest first | 15 s / 82 s | 5 s / 26 s | 16 s / 154 s |
+| One process, decode once, all outputs | 60 s / 60 s | 20 s / 20 s | 101 s / 101 s |
+| One process per rendition, all at once | 36 s / 64 s | 13 s / 22 s | 108 s / 152 s |
+| Smallest alone, then the rest in one process | 14 s / 70 s | 5 s / 24 s | 16 s / 119 s |
+| Smallest and the rest in one process, same priority | 27 s / 60 s | 10 s / 21 s | 52 s / 113 s |
+| **Smallest and the rest in one process, rest at lower priority (used)** | **18 s / 60 s** | **6 s / 21 s** | **22 s / 113 s** |
+| Three tiers (360p, 720p, the rest) at three priorities | not run | 7 s / 23 s | 27 s / 127 s |
+| 360p `ultrafast` preview first, then everything in one process | 12 s / 73 s | 4 s / 26 s | 15 s / 119 s |
+
+"Playable" is when the first rendition is done; before this change a video wasn't watchable until everything was done. The chosen strategy makes a video watchable 4 to 7 times sooner and finishes the whole ladder 18 to 27% sooner. Decoding once is where the total saving comes from, and it grows with the source's resolution because decoding 4K is expensive. The fastest total (one process for everything) leaves nothing playable until the end; the priority split costs 12% on 4K to get 360p out in 22 s instead of 101 s. The 1080p clips are real footage from [intel-iot-devkit/sample-videos](https://github.com/intel-iot-devkit/sample-videos); the 4K clip is the 33 s one upscaled with light grain added, because no real 4K footage was reachable from the benchmark machine. Run it yourself with `node server/bench/encode-strategies.mjs <video> <scratch dir>`.
 
 The result on disk:
 
@@ -107,6 +131,8 @@ data/videos/<id>/
 
 The API serves the HLS files as static files under `/media`. Playlists are sent with `no-cache` and segments with a one-year immutable cache, because a segment never changes once written. The watch page passes `master.m3u8` to [hls.js](https://github.com/video-dev/hls.js), which feeds segments to the `<video>` element through Media Source Extensions. On **Auto**, hls.js measures how fast each segment downloads and picks the rendition for the next one. Choosing a quality from the menu sets `hls.currentLevel`, which pins that rendition until you go back to Auto. Safari plays HLS natively and chooses quality itself, so the menu doesn't appear there.
 
+A video can be watched while it is still encoding. Players read the master playlist once, so while the video is still `processing` the watch page polls it, and when a new rendition is published the player reloads the master playlist and carries on from the same position, playing or paused as before, with the same quality picked. The new quality then shows up in the menu and Auto can switch up to it.
+
 ### Accounts
 
 `server/src/auth.ts`
@@ -120,7 +146,8 @@ docker-compose.yml   postgres, redis, api, worker, web (nginx)
 server/              Express API and encoding worker (one image, two commands)
   src/uploads.ts     chunked upload endpoints
   src/transcode.ts   ffprobe, the bitrate ladder, ffmpeg HLS encoding, playlists
-  src/pipeline.ts    one video's encode, start to finish
+  src/pipeline.ts    one video's encode, start to finish, publishing each rendition as it lands
+  bench/             encode-strategies.mjs, the benchmark behind the encoding strategy
   src/worker.ts      queue consumer
   test/              end to end test against real Postgres, Redis and ffmpeg
 web/                 React + Vite frontend

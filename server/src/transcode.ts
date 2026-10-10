@@ -39,6 +39,15 @@ export function planRenditions(srcWidth: number, srcHeight: number): PlannedRend
   return [{ ...fit(smallest, short), name: `${even(short)}p` }];
 }
 
+/**
+ * Split a plan into encode groups, smallest first. The smallest rendition is encoded on its own so the
+ * video becomes playable as early as possible; the rest share one ffmpeg run that decodes the source once.
+ */
+export function encodeGroups(plan: PlannedRendition[]): PlannedRendition[][] {
+  const ascending = [...plan].sort((a, b) => a.width * a.height - b.width * b.height);
+  return [ascending.slice(0, 1), ascending.slice(1)].filter((g) => g.length > 0);
+}
+
 export function bandwidthFor(r: { videoKbps: number }, hasAudio: boolean) {
   // Peak bits per second the player should budget for, with ~10% container overhead.
   return Math.round((r.videoKbps * 1.07 + (hasAudio ? AUDIO_KBPS : 0)) * 1000 * 1.1);
@@ -57,9 +66,13 @@ export function masterPlaylist(renditions: PlannedRendition[], hasAudio: boolean
   return lines.join("\n") + "\n";
 }
 
-function run(cmd: string, args: string[], onStdout?: (chunk: string) => void) {
+type RunOptions = { nice?: number; signal?: AbortSignal };
+
+function run(cmd: string, args: string[], onStdout?: (chunk: string) => void, opts: RunOptions = {}) {
   return new Promise<string>((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    // `nice` lowers the process's CPU priority, so a concurrent encode at normal priority gets the cores first.
+    const [bin, argv] = opts.nice ? ["nice", ["-n", String(opts.nice), cmd, ...args]] : [cmd, args];
+    const child = spawn(bin, argv, { stdio: ["ignore", "pipe", "pipe"], signal: opts.signal });
     let out = "";
     let err = "";
     child.stdout.setEncoding("utf8").on("data", (d: string) => {
@@ -97,21 +110,11 @@ export async function probe(file: string): Promise<Probe> {
   };
 }
 
-/** Encode one rendition to HLS: H.264 + AAC, cut into SEGMENT_SECONDS segments under `outDir/<name>/`. */
-export async function encodeRendition(
-  source: string,
-  outDir: string,
-  r: PlannedRendition,
-  src: Probe,
-  onProgress: (fraction: number) => void,
-) {
+/** The output options for one rendition: H.264 + AAC, cut into SEGMENT_SECONDS segments under `outDir/<name>/`. */
+function renditionOutput(outDir: string, r: PlannedRendition, src: Probe, video: string[]) {
   const dir = path.join(outDir, r.name);
-  await fsp.mkdir(dir, { recursive: true });
-  const args = [
-    "-y", "-hide_banner", "-nostats", "-progress", "pipe:1",
-    "-i", source,
-    "-map", "0:v:0", ...(src.hasAudio ? ["-map", "0:a:0"] : []),
-    "-vf", `scale=${r.width}:${r.height}`,
+  return [
+    ...video, ...(src.hasAudio ? ["-map", "0:a:0"] : []),
     "-c:v", "libx264", "-preset", "veryfast", "-profile:v", r.profile, "-level:v", r.level, "-pix_fmt", "yuv420p",
     "-b:v", `${r.videoKbps}k`, "-maxrate", `${Math.round(r.videoKbps * 1.07)}k`, "-bufsize", `${r.videoKbps * 2}k`,
     // A keyframe exactly every SEGMENT_SECONDS lines segment boundaries up across renditions.
@@ -121,16 +124,52 @@ export async function encodeRendition(
     "-hls_segment_filename", path.join(dir, "segment_%04d.ts"),
     path.join(dir, "index.m3u8"),
   ];
+}
+
+/**
+ * The ffmpeg arguments that encode several renditions in one process. The source is decoded once and the
+ * frames are split and scaled for each output, instead of every rendition decoding the whole source again.
+ */
+export function encodeArgs(source: string, outDir: string, rs: PlannedRendition[], src: Probe) {
+  const head = ["-y", "-hide_banner", "-nostats", "-progress", "pipe:1", "-i", source];
+  if (rs.length === 1) {
+    return [...head, ...renditionOutput(outDir, rs[0], src, ["-map", "0:v:0", "-vf", `scale=${rs[0].width}:${rs[0].height}`])];
+  }
+  const graph = [
+    `[0:v]split=${rs.length}${rs.map((_, i) => `[in${i}]`).join("")}`,
+    ...rs.map((r, i) => `[in${i}]scale=${r.width}:${r.height}[out${i}]`),
+  ].join(";");
+  return [...head, "-filter_complex", graph, ...rs.flatMap((r, i) => renditionOutput(outDir, r, src, ["-map", `[out${i}]`]))];
+}
+
+/**
+ * Encode one or more renditions to HLS in a single ffmpeg run. All outputs advance together, so they
+ * finish together. `nice` runs it at a lower CPU priority (see processVideo).
+ */
+export async function encodeRenditions(
+  source: string,
+  outDir: string,
+  rs: PlannedRendition[],
+  src: Probe,
+  onProgress: (fraction: number) => void,
+  opts: RunOptions = {},
+) {
+  await Promise.all(rs.map((r) => fsp.mkdir(path.join(outDir, r.name), { recursive: true })));
   let buffer = "";
-  await run("ffmpeg", args, (chunk) => {
-    buffer += chunk;
-    const matches = [...buffer.matchAll(/out_time_us=(\d+)/g)];
-    if (matches.length) {
-      const us = Number(matches[matches.length - 1][1]);
-      onProgress(Math.min(1, us / 1e6 / src.durationSeconds));
-      buffer = buffer.slice(buffer.lastIndexOf("out_time_us="));
-    }
-  });
+  await run(
+    "ffmpeg",
+    encodeArgs(source, outDir, rs, src),
+    (chunk) => {
+      buffer += chunk;
+      const matches = [...buffer.matchAll(/out_time_us=(\d+)/g)];
+      if (matches.length) {
+        const us = Number(matches[matches.length - 1][1]);
+        onProgress(Math.min(1, us / 1e6 / src.durationSeconds));
+        buffer = buffer.slice(buffer.lastIndexOf("out_time_us="));
+      }
+    },
+    opts,
+  );
   onProgress(1);
 }
 
