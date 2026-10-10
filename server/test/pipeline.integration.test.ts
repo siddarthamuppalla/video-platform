@@ -22,10 +22,10 @@ const agent = request.agent(createApp());
 
 beforeAll(async () => {
   await migrate();
-  // A 7 second 640x360 test pattern with a tone: small enough to encode in a few seconds.
+  // A 7 second 720p test pattern with a tone: two renditions (360p, then 720p), encoded in a few seconds.
   execFileSync("ffmpeg", [
     "-loglevel", "error", "-y",
-    "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25",
+    "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25",
     "-f", "lavfi", "-i", "sine=frequency=440",
     "-t", "7", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest", sample,
   ]);
@@ -94,22 +94,58 @@ describe("upload to playback", () => {
     await request(createApp()).get(`/api/videos/${videoId}`).expect(404);
   });
 
-  it("encodes HLS renditions and a thumbnail", async () => {
-    await processVideo(videoId);
+  it("makes the video playable at 360p before 720p is done, then finishes both", async () => {
+    // Watch the video the way a viewer's page would while it encodes.
+    const seen: { status: string; renditions: string[]; master: string }[] = [];
+    let encoding = true;
+    const watching = (async () => {
+      while (encoding) {
+        const { body } = await agent.get(`/api/videos/${videoId}`);
+        if (body.video?.hlsUrl) {
+          const master = await agent.get(body.video.hlsUrl);
+          seen.push({ status: body.video.status, renditions: body.video.renditions.map((r: { name: string }) => r.name), master: master.text });
+        }
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    })();
+    await processVideo(videoId).finally(() => (encoding = false));
+    await watching;
+
+    const early = seen.find((s) => s.status === "processing");
+    expect(early?.renditions).toEqual(["360p"]);
+    expect(early?.master).toContain("360p/index.m3u8");
+    expect(early?.master).not.toContain("720p");
+
     const { body } = await agent.get(`/api/videos/${videoId}`).expect(200);
     expect(body.video.status).toBe("ready");
-    expect(body.video.renditions.map((r: { name: string }) => r.name)).toEqual(["360p"]);
+    expect(body.video.playable).toBe(true);
+    expect(body.video.renditions.map((r: { name: string }) => r.name)).toEqual(["720p", "360p"]);
     expect(Math.round(body.video.durationSeconds)).toBe(7);
 
     const master = await agent.get(body.video.hlsUrl).expect(200);
     expect(master.headers["content-type"]).toContain("mpegurl");
     expect(master.text).toContain("360p/index.m3u8");
+    expect(master.text).toContain("720p/index.m3u8");
 
     const media = await agent.get(`/media/${videoId}/360p/index.m3u8`).expect(200);
     const segments = media.text.split("\n").filter((l) => l.endsWith(".ts"));
     expect(segments.length).toBe(2); // 7 seconds cut at 6 second boundaries
     await agent.get(`/media/${videoId}/360p/${segments[0]}`).expect(200);
+    // Both renditions cut at the same timestamps, so players can switch between them at any segment.
+    const hd = await agent.get(`/media/${videoId}/720p/index.m3u8`).expect(200);
+    const durations = (text: string) => text.split("\n").filter((l) => l.startsWith("#EXTINF"));
+    expect(durations(hd.text)).toEqual(durations(media.text));
     await agent.get(body.video.thumbnailUrl).expect(200);
+  });
+
+  it("keeps published renditions when the job runs again, as a retry would", async () => {
+    const segment = path.join(storage, "videos", videoId, "720p", "segment_0000.ts");
+    const before = fs.statSync(segment).mtimeMs;
+    await processVideo(videoId);
+    expect(fs.statSync(segment).mtimeMs).toBe(before);
+    const { body } = await agent.get(`/api/videos/${videoId}`).expect(200);
+    expect(body.video.status).toBe("ready");
+    expect(body.video.renditions).toHaveLength(2);
   });
 
   it("keeps the original upload private", async () => {

@@ -28,8 +28,12 @@ type VideoRow = {
 
 const SELECT = `SELECT v.*, u.username FROM videos v JOIN users u ON u.id = v.user_id`;
 
+/** A video can be watched once its first rendition is published, even while larger ones are still encoding. */
+const isPlayable = (v: Pick<VideoRow, "renditions">) => v.renditions.length > 0;
+const PLAYABLE_SQL = "jsonb_array_length(v.renditions) > 0";
+
 function present(v: VideoRow) {
-  const ready = v.status === "ready";
+  const playable = isPlayable(v);
   return {
     id: v.id,
     title: v.title,
@@ -45,8 +49,9 @@ function present(v: VideoRow) {
     views: v.views,
     createdAt: v.created_at,
     owner: { id: v.user_id, username: v.username },
-    thumbnailUrl: ready ? `/media/${v.id}/thumbnail.jpg` : null,
-    hlsUrl: ready ? `/media/${v.id}/master.m3u8` : null,
+    playable,
+    thumbnailUrl: playable ? `/media/${v.id}/thumbnail.jpg` : null,
+    hlsUrl: playable ? `/media/${v.id}/master.m3u8` : null,
   };
 }
 
@@ -60,12 +65,12 @@ async function findVideo(id: string) {
 
 export const videosRouter = Router();
 
-// Public list: only finished videos, newest first, with optional title search.
+// Public list: only playable videos, newest first, with optional title search.
 videosRouter.get("/", async (req, res) => {
   const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
   const { rows } = await query<VideoRow>(
-    `${SELECT} WHERE v.status = 'ready' AND ($1 = '' OR v.title ILIKE '%' || $1 || '%')
-     ORDER BY v.ready_at DESC NULLS LAST, v.created_at DESC LIMIT 60`,
+    `${SELECT} WHERE ${PLAYABLE_SQL} AND ($1 = '' OR v.title ILIKE '%' || $1 || '%')
+     ORDER BY v.playable_at DESC NULLS LAST, v.created_at DESC LIMIT 60`,
     [q],
   );
   res.json({ videos: rows.map(present) });
@@ -81,14 +86,14 @@ videosRouter.get("/mine", requireUser, async (req, res) => {
 
 videosRouter.get("/:id", async (req, res) => {
   const v = await findVideo(String(req.params.id));
-  if (!v || (v.status !== "ready" && v.user_id !== req.user?.id)) throw new HttpError(404, "Video not found.");
+  if (!v || (!isPlayable(v) && v.user_id !== req.user?.id)) throw new HttpError(404, "Video not found.");
   res.json({ video: present(v) });
 });
 
 videosRouter.post("/:id/view", async (req, res) => {
   if (!isUuid(String(req.params.id))) throw new HttpError(404, "Video not found.");
   const { rows } = await query<{ views: number }>(
-    "UPDATE videos SET views = views + 1 WHERE id = $1 AND status = 'ready' RETURNING views",
+    `UPDATE videos v SET views = views + 1 WHERE id = $1 AND ${PLAYABLE_SQL} RETURNING views`,
     [req.params.id],
   );
   if (!rows[0]) throw new HttpError(404, "Video not found.");

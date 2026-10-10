@@ -48,7 +48,7 @@ export function MyVideos() {
             <div className="mine__body">
               <Link className="mine__title type-heading" to={`/watch/${v.id}`}>{v.title}</Link>
               <p className="type-small mine__meta">
-                {v.status === "ready" ? `${formatViews(v.views)} · ` : ""}uploaded {timeAgo(v.createdAt)}
+                {v.playable ? `${formatViews(v.views)} · ` : ""}uploaded {timeAgo(v.createdAt)}
               </p>
               {v.status === "failed" && v.error && <p className="type-small mine__error">{v.error}</p>}
               {v.status === "processing" && (

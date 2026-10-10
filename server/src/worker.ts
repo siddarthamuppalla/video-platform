@@ -21,11 +21,15 @@ worker.on("failed", async (job, err) => {
   if (!job) return;
   console.error(`failed ${job.data.videoId}: ${err.message}`);
   const final = job.attemptsMade >= (job.opts.attempts ?? 1);
-  await query("UPDATE videos SET status = $2, error = $3, stage = NULL WHERE id = $1", [
-    job.data.videoId,
-    final ? "failed" : "queued",
-    err.message.slice(0, 500),
-  ]);
+  // A video with published renditions stays watchable: a retry keeps them, and if the last attempt fails
+  // it is marked ready with the qualities it has, keeping the error for its owner.
+  await query(
+    `UPDATE videos SET error = $3, stage = NULL,
+       status = CASE WHEN jsonb_array_length(renditions) > 0 THEN (CASE WHEN $2::boolean THEN 'ready' ELSE 'processing' END)
+                     WHEN $2::boolean THEN 'failed' ELSE 'queued' END
+     WHERE id = $1`,
+    [job.data.videoId, final, err.message.slice(0, 500)],
+  );
 });
 
 console.log("worker waiting for jobs");

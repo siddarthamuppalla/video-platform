@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bandwidthFor, masterPlaylist, planRenditions } from "./transcode.js";
+import { bandwidthFor, encodeArgs, encodeGroups, masterPlaylist, planRenditions } from "./transcode.js";
 
 const summary = (w: number, h: number) => planRenditions(w, h).map((r) => `${r.name} ${r.width}x${r.height}`);
 
@@ -67,5 +67,44 @@ describe("masterPlaylist", () => {
 
   it("drops the audio codec for silent videos", () => {
     expect(masterPlaylist(planRenditions(640, 360), false)).toContain('CODECS="avc1.4d4028"');
+  });
+});
+
+describe("encodeGroups", () => {
+  const names = (w: number, h: number) => encodeGroups(planRenditions(w, h)).map((g) => g.map((r) => r.name));
+
+  it("encodes the smallest rendition on its own first, then everything else together", () => {
+    expect(names(3840, 2160)).toEqual([["360p"], ["720p", "1080p", "1440p", "2160p"]]);
+    expect(names(1920, 1080)).toEqual([["360p"], ["720p", "1080p"]]);
+    expect(names(1280, 720)).toEqual([["360p"], ["720p"]]);
+  });
+
+  it("has a single group when there is a single rendition", () => {
+    expect(names(640, 360)).toEqual([["360p"]]);
+    expect(encodeGroups([])).toEqual([]);
+  });
+});
+
+describe("encodeArgs", () => {
+  const src = { durationSeconds: 10, width: 1920, height: 1080, hasAudio: true };
+  const [, rest] = encodeGroups(planRenditions(1920, 1080));
+
+  it("decodes the source once and splits it for each rendition", () => {
+    const args = encodeArgs("/v/source.mp4", "/v", rest, src);
+    expect(args.filter((a) => a === "-i")).toHaveLength(1);
+    expect(args[args.indexOf("-filter_complex") + 1]).toBe(
+      "[0:v]split=2[in0][in1];[in0]scale=1280:720[out0];[in1]scale=1920:1080[out1]",
+    );
+    expect(args.filter((a) => a.endsWith("index.m3u8"))).toEqual(["/v/720p/index.m3u8", "/v/1080p/index.m3u8"]);
+    // Each output gets its own bitrate and the shared keyframe cadence that keeps segments aligned.
+    expect(args.filter((a) => a === "-b:v").length).toBe(2);
+    expect(args.filter((a) => a === "expr:gte(t,n_forced*6)").length).toBe(2);
+  });
+
+  it("uses a plain scale filter for a single rendition", () => {
+    const args = encodeArgs("/v/source.mp4", "/v", planRenditions(640, 360), { ...src, hasAudio: false });
+    expect(args).not.toContain("-filter_complex");
+    expect(args[args.indexOf("-vf") + 1]).toBe("scale=640:360");
+    expect(args).not.toContain("0:a:0");
   });
 });

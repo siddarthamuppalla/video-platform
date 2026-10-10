@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS videos (
   ready_at         timestamptz
 );
 CREATE INDEX IF NOT EXISTS videos_status_created ON videos (status, created_at DESC);
+-- When the first (smallest) rendition was published. A video is watchable from then on, while larger ones encode.
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS playable_at timestamptz;
+UPDATE videos SET playable_at = ready_at WHERE playable_at IS NULL AND ready_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS uploads (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
