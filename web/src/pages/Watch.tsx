@@ -35,6 +35,7 @@ export function Watch() {
       {video.hlsUrl ? (
         <Player
           src={video.hlsUrl}
+          version={video.renditions.map((r) => r.name).join(",")}
           poster={video.thumbnailUrl ?? undefined}
           onFirstPlay={() => {
             api<{ views: number }>("POST", `/api/videos/${video.id}/view`).then((r) => setVideo((v) => v && { ...v, views: r.views }));
@@ -43,15 +44,24 @@ export function Watch() {
       ) : (
         <div className="player player--pending">
           <StatusBadge video={video} />
-          <p>{video.status === "failed" ? video.error ?? "Encoding failed." : "This video will play here as soon as encoding finishes."}</p>
+          <p>
+            {video.status === "failed"
+              ? video.error ?? "Encoding failed."
+              : "This video will play here as soon as its first quality is encoded."}
+          </p>
         </div>
+      )}
+      {video.hlsUrl && video.status === "processing" && (
+        <p className="watch__encoding type-small">
+          <StatusBadge video={video} /> Higher qualities are still encoding and join the quality menu as each one finishes.
+        </p>
       )}
       <section className="watch__info">
         <h1 className="type-display watch__title">{video.title}</h1>
         <p className="watch__meta">
           {video.owner.username} · {formatViews(video.views)} · {timeAgo(video.createdAt)}
         </p>
-        {video.status === "ready" && (
+        {video.playable && (
           <p className="watch__tech type-timecode">
             {formatDuration(video.durationSeconds)} · source {video.width}×{video.height} · {video.renditions.map((r) => r.name).join(" / ")}
           </p>
