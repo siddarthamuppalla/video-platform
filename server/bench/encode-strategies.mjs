@@ -1,8 +1,10 @@
 // Times different ways of encoding the HLS ladder for one source video, using the worker's encoder settings.
 // Usage: node encode-strategies.mjs <video> <scratch dir> [strategy name prefix...]
 // Prints when the first rendition was done ("firstPlayable") and when all were done ("total"), in seconds.
+// RATE=crf switches every strategy from a target bitrate to capped CRF 21, the setting the worker now uses.
 import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const LADDER = [
@@ -13,7 +15,7 @@ const LADDER = [
   { name: "360p", height: 360, kbps: 800, profile: "main", level: "4.0" },
 ];
 const [source, outRoot, ...only] = process.argv.slice(2);
-const probe = JSON.parse(execFileSync("ffprobe", ["-v", "error", "-print_format", "json", "-show_streams", source]));
+const probe = JSON.parse(execFileSync("ffprobe", ["-v", "error", "-print_format", "json", "-show_streams", "-show_format", source]));
 const v = probe.streams.find((s) => s.codec_type === "video");
 const hasAudio = probe.streams.some((s) => s.codec_type === "audio");
 const even = (n) => Math.max(2, Math.round(n / 2) * 2);
@@ -24,6 +26,7 @@ const plan = LADDER.filter((r) => r.height <= short).map((r) => ({
   h: even((v.height * r.height) / short),
 }));
 const preset = process.env.PRESET || "veryfast";
+const rate = (r) => (process.env.RATE === "crf" ? ["-crf", "21"] : ["-b:v", `${r.kbps}k`]);
 
 function outputArgs(r, dir, videoLabel) {
   fs.mkdirSync(path.join(dir, r.name), { recursive: true });
@@ -31,7 +34,7 @@ function outputArgs(r, dir, videoLabel) {
     ...(videoLabel ? ["-map", videoLabel] : ["-map", "0:v:0", "-vf", `scale=${r.w}:${r.h}`]),
     ...(hasAudio ? ["-map", "0:a:0"] : []),
     "-c:v", "libx264", "-preset", r.preset ?? preset, "-profile:v", r.profile, "-level:v", r.level, "-pix_fmt", "yuv420p",
-    "-b:v", `${r.kbps}k`, "-maxrate", `${Math.round(r.kbps * 1.07)}k`, "-bufsize", `${r.kbps * 2}k`,
+    ...rate(r), "-maxrate", `${Math.round(r.kbps * 1.07)}k`, "-bufsize", `${r.kbps * 2}k`,
     "-force_key_frames", "expr:gte(t,n_forced*6)", "-sc_threshold", "0",
     ...(hasAudio ? ["-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000"] : []),
     "-f", "hls", "-hls_time", "6", "-hls_playlist_type", "vod",
@@ -54,6 +57,45 @@ function run(args, nice = 0) {
       : spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "inherit"] });
     c.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg ${code}`))));
   });
+}
+
+// Chunked, as the worker does it: 6 s chunks cut exactly with trim, the smallest rendition's chunks first, then the
+// rest decoded once per chunk, one task per core at a time, and the audio encoded once on the side.
+const duration = Number(probe.format.duration);
+const chunks = [];
+for (let start = 0; start < duration - 1 || chunks.length === 0; start += 6) chunks.push({ start, end: start + 6 < duration - 1 ? start + 6 : null });
+function chunkTask(c, i, rs, dir) {
+  const cut = `trim=start=${c.start}${c.end === null ? "" : `:end=${c.end}`},setpts=PTS/TB`;
+  const graph = [`[0:v]${cut},split=${rs.length}${rs.map((_, j) => `[s${j}]`).join("")}`, ...rs.map((r, j) => `[s${j}]scale=${r.w}:${r.h}[o${j}]`)].join(";");
+  for (const r of rs) fs.mkdirSync(path.join(dir, r.name), { recursive: true });
+  return ["-y", "-v", "error", "-ss", String(Math.max(0, c.start - 1)), "-copyts", "-i", source, "-filter_complex", graph, ...rs.flatMap((r, j) => [
+    "-map", `[o${j}]`, "-c:v", "libx264", "-preset", preset, "-threads", "1", "-profile:v", r.profile, "-level:v", r.level, "-pix_fmt", "yuv420p",
+    ...rate(r), "-maxrate", `${Math.round(r.kbps * 1.07)}k`, "-bufsize", `${r.kbps * 2}k`,
+    "-avoid_negative_ts", "disabled", "-f", "mpegts", path.join(dir, r.name, `segment_${String(i).padStart(4, "0")}.ts`),
+  ])];
+}
+async function chunked(dir, mark) {
+  const tiers = [[...plan].reverse().slice(0, 1), [...plan].reverse().slice(1)].filter((t) => t.length);
+  const tasks = [
+    ...(hasAudio ? [{ args: ["-y", "-v", "error", "-i", source, "-vn", "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000", "-f", "hls", "-hls_time", "6", path.join(dir, "audio.m3u8")] }] : []),
+    ...tiers.flatMap((rs, tier) => chunks.map((c, i) => ({ tier, args: chunkTask(c, i, rs, dir) }))),
+  ];
+  const left = tiers.map(() => chunks.length);
+  let audioDone = !hasAudio;
+  const published = new Set();
+  const publish = () => tiers.forEach((rs, t) => {
+    if (left[t] === 0 && audioDone && !published.has(t)) { published.add(t); rs.forEach((r) => mark(r.name)); }
+  });
+  let next = 0;
+  const lane = async () => {
+    while (next < tasks.length) {
+      const t = tasks[next++];
+      await run(t.args);
+      if (t.tier === undefined) audioDone = true; else left[t.tier]--;
+      publish();
+    }
+  };
+  await Promise.all(Array.from({ length: os.availableParallelism() }, lane));
 }
 
 const asc = [...plan].reverse();
@@ -92,6 +134,7 @@ const strategies = {
     const groups = [[asc[0]], asc.slice(1, 2), asc.slice(2)].filter((g) => g.length);
     await Promise.all(groups.map((g, i) => run(g.length === 1 ? single(g[0], dir) : multi(g, dir), i * 5).then(() => g.forEach((r) => mark(r.name)))));
   },
+  "chunked: 6 s chunks, smallest rendition's chunks first, one task per core": chunked,
   "smallest ultrafast first, then single pass for all": async (dir, mark) => {
     await run(single({ ...smallest, preset: "ultrafast" }, dir)); mark(smallest.name + "(uf)");
     await run(multi(asc, dir)); asc.forEach((r) => mark(r.name));

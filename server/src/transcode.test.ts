@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bandwidthFor, encodeArgs, encodeGroups, masterPlaylist, planRenditions } from "./transcode.js";
+import { bandwidthFor, chunkArgs, encodeGroups, masterPlaylist, mediaPlaylist, planChunks, planRenditions } from "./transcode.js";
 
 const summary = (w: number, h: number) => planRenditions(w, h).map((r) => `${r.name} ${r.width}x${r.height}`);
 
@@ -46,15 +46,17 @@ describe("planRenditions", () => {
 });
 
 describe("masterPlaylist", () => {
-  it("lists each rendition with bandwidth, resolution, codec and its playlist path", () => {
+  it("lists each rendition with bandwidth, resolution, codec and its playlist path, sharing one audio playlist", () => {
     const plan = planRenditions(1280, 720);
     expect(masterPlaylist(plan, true)).toBe(
       [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
-        `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidthFor(plan[0], true)},RESOLUTION=1280x720,CODECS="avc1.4d4028,mp4a.40.2",NAME="720p"`,
+        "#EXT-X-INDEPENDENT-SEGMENTS",
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio/index.m3u8"',
+        `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidthFor(plan[0], true)},RESOLUTION=1280x720,CODECS="avc1.4d4028,mp4a.40.2",NAME="720p",AUDIO="audio"`,
         "720p/index.m3u8",
-        `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidthFor(plan[1], true)},RESOLUTION=640x360,CODECS="avc1.4d4028,mp4a.40.2",NAME="360p"`,
+        `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidthFor(plan[1], true)},RESOLUTION=640x360,CODECS="avc1.4d4028,mp4a.40.2",NAME="360p",AUDIO="audio"`,
         "360p/index.m3u8",
         "",
       ].join("\n"),
@@ -65,8 +67,55 @@ describe("masterPlaylist", () => {
     expect(masterPlaylist(planRenditions(3840, 2160), true)).toContain('RESOLUTION=3840x2160,CODECS="avc1.640034,mp4a.40.2",NAME="2160p"');
   });
 
-  it("drops the audio codec for silent videos", () => {
-    expect(masterPlaylist(planRenditions(640, 360), false)).toContain('CODECS="avc1.4d4028"');
+  it("drops the audio codec and audio group for silent videos", () => {
+    const master = masterPlaylist(planRenditions(640, 360), false);
+    expect(master).toContain('CODECS="avc1.4d4028",NAME="360p"\n');
+    expect(master).not.toContain("TYPE=AUDIO");
+  });
+});
+
+describe("planChunks", () => {
+  const spans = (d: number) => planChunks(d).map((c) => [c.start, c.end]);
+
+  it("cuts the timeline into 6 second chunks, the last one running to the end", () => {
+    expect(spans(15.5)).toEqual([[0, 6], [6, 12], [12, null]]);
+    expect(planChunks(15.5).map((c) => c.index)).toEqual([0, 1, 2]);
+  });
+
+  it("does not add an empty chunk when the length is a multiple of 6", () => {
+    expect(spans(12)).toEqual([[0, 6], [6, null]]);
+  });
+
+  it("folds a leftover under a second into the chunk before it", () => {
+    expect(spans(12.4)).toEqual([[0, 6], [6, null]]);
+    expect(spans(13.2)).toEqual([[0, 6], [6, 12], [12, null]]);
+  });
+
+  it("keeps a short video as one chunk", () => {
+    expect(spans(0.5)).toEqual([[0, null]]);
+    expect(spans(4)).toEqual([[0, null]]);
+  });
+});
+
+describe("mediaPlaylist", () => {
+  it("lists one segment per chunk with its real length, and a target duration that covers the longest", () => {
+    expect(mediaPlaylist([6.006, 5.989, 0.5]).split("\n")).toEqual([
+      "#EXTM3U",
+      "#EXT-X-VERSION:3",
+      "#EXT-X-TARGETDURATION:7",
+      "#EXT-X-MEDIA-SEQUENCE:0",
+      "#EXT-X-PLAYLIST-TYPE:VOD",
+      "#EXT-X-INDEPENDENT-SEGMENTS",
+      "#EXTINF:6.006000,",
+      "segment_0000.ts",
+      "#EXTINF:5.989000,",
+      "segment_0001.ts",
+      "#EXTINF:0.500000,",
+      "segment_0002.ts",
+      "#EXT-X-ENDLIST",
+      "",
+    ]);
+    expect(mediaPlaylist([6, 6, 6])).toContain("#EXT-X-TARGETDURATION:6\n");
   });
 });
 
@@ -85,26 +134,41 @@ describe("encodeGroups", () => {
   });
 });
 
-describe("encodeArgs", () => {
-  const src = { durationSeconds: 10, width: 1920, height: 1080, hasAudio: true };
-  const [, rest] = encodeGroups(planRenditions(1920, 1080));
+describe("chunkArgs", () => {
+  const src = { durationSeconds: 20, startSeconds: 0, width: 1920, height: 1080, hasAudio: true };
+  const [small, rest] = encodeGroups(planRenditions(1920, 1080));
+  const chunks = planChunks(20);
+  const middle = chunks[1];
+  const last = chunks[chunks.length - 1];
 
-  it("decodes the source once and splits it for each rendition", () => {
-    const args = encodeArgs("/v/source.mp4", "/v", rest, src);
-    expect(args.filter((a) => a === "-i")).toHaveLength(1);
+  it("seeks just before the chunk, cuts it exactly and keeps its place on the timeline", () => {
+    const args = chunkArgs("/v/source.mp4", "/v", middle, rest, src);
+    expect(args.slice(args.indexOf("-ss"), args.indexOf("-i") + 2)).toEqual(["-ss", "5.000000", "-copyts", "-i", "/v/source.mp4"]);
     expect(args[args.indexOf("-filter_complex") + 1]).toBe(
-      "[0:v]split=2[in0][in1];[in0]scale=1280:720[out0];[in1]scale=1920:1080[out1]",
+      "[0:v]trim=start=6.000000:end=12.000000,setpts=PTS-0.000000/TB,split=2[in0][in1];[in0]scale=1280:720[out0];[in1]scale=1920:1080[out1]",
     );
-    expect(args.filter((a) => a.endsWith("index.m3u8"))).toEqual(["/v/720p/index.m3u8", "/v/1080p/index.m3u8"]);
-    // Each output gets its own bitrate and the shared keyframe cadence that keeps segments aligned.
-    expect(args.filter((a) => a === "-b:v").length).toBe(2);
-    expect(args.filter((a) => a === "expr:gte(t,n_forced*6)").length).toBe(2);
+    expect(args.filter((a) => a === "-avoid_negative_ts")).toHaveLength(2);
   });
 
-  it("uses a plain scale filter for a single rendition", () => {
-    const args = encodeArgs("/v/source.mp4", "/v", planRenditions(640, 360), { ...src, hasAudio: false });
-    expect(args).not.toContain("-filter_complex");
-    expect(args[args.indexOf("-vf") + 1]).toBe("scale=640:360");
+  it("decodes the chunk once and writes one segment per rendition, video only", () => {
+    const args = chunkArgs("/v/source.mp4", "/v", middle, rest, src);
+    expect(args.filter((a) => a === "-i")).toHaveLength(1);
+    expect(args.filter((a) => a.endsWith(".tmp"))).toEqual(["/v/720p/segment_0001.ts.tmp", "/v/1080p/segment_0001.ts.tmp"]);
     expect(args).not.toContain("0:a:0");
+    // Capped CRF: a quality target per output, with the rung's bitrate as a ceiling.
+    expect(args.filter((a) => a === "-crf")).toHaveLength(2);
+    expect(args[args.indexOf("-maxrate") + 1]).toBe("2996k");
+  });
+
+  it("runs the last chunk to the end of the file and offsets by the file's start time", () => {
+    const args = chunkArgs("/v/source.mp4", "/v", last, small, { ...src, startSeconds: 1.5 });
+    expect(args[args.indexOf("-filter_complex") + 1]).toBe(
+      "[0:v]trim=start=19.500000,setpts=PTS-1.500000/TB,split=1[in0];[in0]scale=640:360[out0]",
+    );
+  });
+
+  it("does not seek before the start of the file", () => {
+    const args = chunkArgs("/v/source.mp4", "/v", chunks[0], small, src);
+    expect(args[args.indexOf("-ss") + 1]).toBe("0.000000");
   });
 });

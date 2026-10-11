@@ -1,27 +1,57 @@
-import fs from "node:fs";
 import fsp from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { paths } from "./config.js";
-import { query } from "./db.js";
+import { pool, query } from "./db.js";
+import { enqueueTasks, type ChunkJob } from "./queue.js";
 import {
   bandwidthFor,
-  encodeRenditions,
+  encodeAudio,
+  encodeChunk,
   encodeGroups,
   makeThumbnail,
   masterPlaylist,
+  mediaPlaylist,
+  planChunks,
   planRenditions,
   probe,
+  type Chunk,
   type PlannedRendition,
+  type Probe,
 } from "./transcode.js";
 
 /**
- * Each encode group after the first runs this many nice levels lower, so smaller renditions get the CPU
- * first. At 10 the low-priority process gets roughly a tenth of a contested core.
+ * How a video is encoded, in three steps that can run on different machines:
+ *
+ * 1. planVideo (the `transcode` job): probe the source, cut its timeline into chunks, write one encode_tasks row
+ *    per task and queue the tasks.
+ * 2. runTask (an `encode-chunk` job): encode one tier of one chunk into one segment per rendition, or the audio.
+ * 3. syncVideo (after every task): when every chunk of a rendition is done, write its playlist and add it to the
+ *    master playlist, which makes it playable.
  */
-const NICE_STEP = 10;
 
-async function setProgress(videoId: string, progress: number, stage: string) {
-  await query("UPDATE videos SET progress = $2, stage = $3 WHERE id = $1", [videoId, Math.round(progress), stage]);
+/** What the planner decided, stored on the video so chunk workers never have to re-probe the source. */
+export type EncodePlan = {
+  probe: Probe;
+  renditions: PlannedRendition[]; // highest first, as in the master playlist
+  tiers: string[][]; // rendition names per tier; tier 0 is encoded first
+  chunks: Chunk[];
+};
+
+type TaskRow = {
+  kind: "video" | "audio";
+  tier: number;
+  chunk: number;
+  status: "queued" | "running" | "done" | "failed";
+  duration_seconds: number | null;
+  error: string | null;
+};
+
+async function sourcePath(videoId: string) {
+  const dir = paths.videoDir(videoId);
+  const source = (await fsp.readdir(dir).catch(() => [])).find((f) => f.startsWith("source."));
+  if (!source) throw new Error("The uploaded file is missing.");
+  return path.join(dir, source);
 }
 
 /** Write to a temp file and rename, so a player fetching the playlist never reads a half-written one. */
@@ -38,96 +68,193 @@ const summary = (r: PlannedRendition, hasAudio: boolean) => ({
   bandwidth: bandwidthFor(r, hasAudio),
 });
 
-export async function processVideo(videoId: string) {
+/**
+ * Step 1. Plan the encode and queue its tasks. Safe to run again, as a retry does: tasks already done are kept and
+ * not queued again, so the renditions they published stay up.
+ */
+export async function planVideo(videoId: string): Promise<ChunkJob[]> {
+  const source = await sourcePath(videoId);
   const dir = paths.videoDir(videoId);
-  const source = (await fsp.readdir(dir)).find((f) => f.startsWith("source."));
-  if (!source) throw new Error("The uploaded file is missing.");
-  const sourcePath = path.join(dir, source);
-
-  const { rows } = await query<{ renditions: { name: string }[] }>("SELECT renditions FROM videos WHERE id = $1", [videoId]);
-  await query("UPDATE videos SET status = 'processing', progress = 0, stage = 'Reading file', error = NULL WHERE id = $1", [videoId]);
-  const info = await probe(sourcePath);
+  await query("UPDATE videos SET status = 'processing', stage = 'Reading file', error = NULL WHERE id = $1", [videoId]);
+  const info = await probe(source);
   await query("UPDATE videos SET duration_seconds = $2, width = $3, height = $4 WHERE id = $1", [
     videoId, info.durationSeconds, info.width, info.height,
   ]);
+  await query("UPDATE videos SET stage = 'Making thumbnail' WHERE id = $1", [videoId]);
+  await makeThumbnail(source, dir, info);
 
-  await setProgress(videoId, 2, "Making thumbnail");
-  await makeThumbnail(sourcePath, dir, info);
+  const renditions = planRenditions(info.width, info.height);
+  const tiers = encodeGroups(renditions).map((g) => g.map((r) => r.name));
+  const plan: EncodePlan = { probe: info, renditions, tiers, chunks: planChunks(info.durationSeconds) };
 
-  const plan = planRenditions(info.width, info.height);
-  // A retry keeps renditions an earlier attempt already published, so the video stays playable while it runs.
-  const published = new Set(
-    (rows[0]?.renditions ?? []).map((r) => r.name).filter((name) => fs.existsSync(path.join(dir, name, "index.m3u8"))),
-  );
-  const done = plan.filter((r) => published.has(r.name));
-  const groups = encodeGroups(plan.filter((r) => !published.has(r.name)));
-
-  // Weight each rendition by pixel count so the bar moves at an even pace.
-  const weight = (rs: PlannedRendition[]) => rs.reduce((sum, r) => sum + r.width * r.height, 0);
-  const totalWeight = weight(plan);
-  const keptWeight = weight(done);
-  const fractions = groups.map(() => 0);
-  const stage = () => {
-    const left = plan.filter((r) => !done.includes(r)).reverse();
-    if (left.length === 0) return "Finishing";
-    return `Encoding ${left.length === 1 ? left[0].name : `${left[0].name}–${left[left.length - 1].name}`}`;
-  };
-
-  // Progress writes and publishes go through one chain, so they land in order and never race each other.
-  let writes: Promise<unknown> = Promise.resolve();
-  const enqueue = (fn: () => Promise<unknown>) => (writes = writes.then(fn));
-  let lastWrite = 0;
-  const reportProgress = () => {
-    const now = Date.now();
-    if (now - lastWrite < 1000) return;
-    lastWrite = now;
-    const encoded = keptWeight + groups.reduce((sum, g, i) => sum + weight(g) * fractions[i], 0);
-    const pct = 5 + (encoded / totalWeight) * 93;
-    const label = stage();
-    enqueue(() => setProgress(videoId, pct, label));
-  };
-
-  // Publishing a rendition makes it playable: it goes into the master playlist and the video's rendition list.
-  const publish = () => {
-    const ladder = plan.filter((r) => done.includes(r));
-    return enqueue(async () => {
-      await writeAtomic(path.join(dir, "master.m3u8"), masterPlaylist(ladder, info.hasAudio));
-      await query(
-        "UPDATE videos SET renditions = $2, stage = $3, playable_at = COALESCE(playable_at, now()) WHERE id = $1",
-        [videoId, JSON.stringify(ladder.map((r) => summary(r, info.hasAudio))), stage()],
+  // Audio first, then the smallest rendition chunk by chunk, then the rest: the order the queue will run them in.
+  const tasks: ChunkJob[] = [
+    ...(info.hasAudio ? [{ videoId, kind: "audio" as const, tier: 0, chunk: 0 }] : []),
+    ...tiers.flatMap((_, tier) => plan.chunks.map((c) => ({ videoId, kind: "video" as const, tier, chunk: c.index }))),
+  ];
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("UPDATE videos SET encode_plan = $2, stage = 'Queued for encoding' WHERE id = $1", [videoId, JSON.stringify(plan)]);
+    for (const t of tasks) {
+      await client.query(
+        `INSERT INTO encode_tasks (video_id, kind, tier, chunk, renditions) VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (video_id, kind, tier, chunk) DO UPDATE SET status = 'queued', error = NULL
+           WHERE encode_tasks.status <> 'done'`,
+        [videoId, t.kind, t.tier, t.chunk, JSON.stringify(t.kind === "audio" ? [] : tiers[t.tier])],
       );
-    });
-  };
-  if (done.length > 0) await publish();
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 
-  // Every group starts at once and they share the CPU, but each later (larger) group runs at a lower
-  // priority. The smallest rendition finishes about as fast as if it ran alone, the cores are never idle,
-  // and the larger renditions decode the source once between them. The benchmark is in the README.
-  // If one group fails, stop the others rather than leave ffmpeg writing into the folder a retry will use.
-  const abort = new AbortController();
-  await Promise.all(
-    groups.map(async (group, i) => {
-      await encodeRenditions(
-        sourcePath,
-        dir,
-        group,
-        info,
-        (fraction) => {
-          fractions[i] = fraction;
-          reportProgress();
-        },
-        { nice: Math.min(19, i * NICE_STEP), signal: abort.signal },
-      ).catch((err) => {
-        abort.abort();
-        throw err;
-      });
-      done.push(...group);
-      await publish();
-    }),
-  ).finally(() => writes);
-
-  await query(
-    `UPDATE videos SET status = 'ready', progress = 100, stage = NULL, ready_at = now() WHERE id = $1`,
+  const { rows } = await query<{ kind: "video" | "audio"; tier: number; chunk: number }>(
+    "SELECT kind, tier, chunk FROM encode_tasks WHERE video_id = $1 AND status <> 'done'",
     [videoId],
   );
+  const pending = tasks.filter((t) => rows.some((r) => r.kind === t.kind && r.tier === t.tier && r.chunk === t.chunk));
+  await enqueueTasks(pending);
+  await syncVideo(videoId);
+  return pending;
+}
+
+const workerName = `${os.hostname()}:${process.pid}`;
+
+/** Step 2. Encode one task. Its row records who ran it, how long the chunk came out and how many bytes it wrote. */
+export async function runTask(task: ChunkJob, opts: { threads?: number; signal?: AbortSignal } = {}) {
+  const { videoId, kind, tier, chunk } = task;
+  const key = [videoId, kind, tier, chunk];
+  const { rows } = await query<{ encode_plan: EncodePlan | null }>("SELECT encode_plan FROM videos WHERE id = $1", [videoId]);
+  const plan = rows[0]?.encode_plan;
+  if (!plan) return; // The video was deleted, or re-planned: nothing to do.
+  const claimed = await query(
+    `UPDATE encode_tasks SET status = 'running', attempts = attempts + 1, worker = $5, started_at = now(), error = NULL
+     WHERE video_id = $1 AND kind = $2 AND tier = $3 AND chunk = $4 AND status <> 'done'`,
+    [...key, workerName],
+  );
+  if (claimed.rowCount === 0) return; // Already done, or the video is gone.
+
+  const source = await sourcePath(videoId);
+  const dir = paths.videoDir(videoId);
+  let result: { durationSeconds?: number; bytes: number };
+  if (kind === "audio") {
+    result = await encodeAudio(source, dir, opts);
+  } else {
+    const rs = plan.renditions.filter((r) => plan.tiers[tier].includes(r.name));
+    result = await encodeChunk(source, dir, plan.chunks[chunk], rs, plan.probe, opts);
+  }
+  const done = await query(
+    `UPDATE encode_tasks SET status = 'done', duration_seconds = $5, bytes = $6, finished_at = now()
+     WHERE video_id = $1 AND kind = $2 AND tier = $3 AND chunk = $4`,
+    [...key, result.durationSeconds ?? null, result.bytes],
+  );
+  if (done.rowCount === 0) {
+    // The video was deleted while this chunk encoded; don't leave its files behind.
+    await fsp.rm(dir, { recursive: true, force: true });
+    return;
+  }
+  await syncVideo(videoId);
+}
+
+/** A task's attempt failed. On its last attempt it is marked failed for good and the video carries on without it. */
+export async function taskFailed(task: ChunkJob, error: string, final: boolean) {
+  await query(
+    `UPDATE encode_tasks SET status = $5, error = $6, finished_at = now()
+     WHERE video_id = $1 AND kind = $2 AND tier = $3 AND chunk = $4 AND status <> 'done'`,
+    [task.videoId, task.kind, task.tier, task.chunk, final ? "failed" : "queued", error.slice(0, 500)],
+  );
+  if (final) await syncVideo(task.videoId);
+}
+
+const range = (names: string[]) => (names.length === 1 ? names[0] : `${names[0]}–${names[names.length - 1]}`);
+
+/**
+ * Step 3. Bring the video's playlists and status up to date with its tasks. Runs after every task, on whichever
+ * worker finished it. The video's row is locked for the duration, so when two workers finish a rendition's last two
+ * chunks at the same moment, exactly one of them sees the rendition complete and publishes it.
+ */
+export async function syncVideo(videoId: string) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query<{ encode_plan: EncodePlan | null; renditions: { name: string }[] }>(
+      "SELECT encode_plan, renditions FROM videos WHERE id = $1 FOR UPDATE",
+      [videoId],
+    );
+    const plan = rows[0]?.encode_plan;
+    if (!plan) {
+      await client.query("COMMIT");
+      return;
+    }
+    const tasks = (
+      await client.query<TaskRow>(
+        "SELECT kind, tier, chunk, status, duration_seconds, error FROM encode_tasks WHERE video_id = $1 ORDER BY chunk",
+        [videoId],
+      )
+    ).rows;
+    const tierTasks = (tier: number) => tasks.filter((t) => t.kind === "video" && t.tier === tier);
+    const tierDone = (tier: number) => tierTasks(tier).length === plan.chunks.length && tierTasks(tier).every((t) => t.status === "done");
+    const audioDone = !plan.probe.hasAudio || tasks.some((t) => t.kind === "audio" && t.status === "done");
+    const tierOf = (name: string) => plan.tiers.findIndex((names) => names.includes(name));
+
+    // A rendition is playable once all its chunks and the audio are encoded. Stitching is only writing its playlist.
+    const complete = plan.renditions.filter((r) => audioDone && tierDone(tierOf(r.name)));
+    const published = new Set(rows[0].renditions.map((r) => r.name));
+    const added = complete.filter((r) => !published.has(r.name));
+    const dir = paths.videoDir(videoId);
+    for (const r of added) {
+      const durations = tierTasks(tierOf(r.name)).map((t) => t.duration_seconds ?? 0);
+      await writeAtomic(path.join(dir, r.name, "index.m3u8"), mediaPlaylist(durations));
+    }
+    if (added.length > 0) await writeAtomic(path.join(dir, "master.m3u8"), masterPlaylist(complete, plan.probe.hasAudio));
+
+    // Progress counts encoded pixels: a 1080p chunk is worth far more than its 360p chunk.
+    const pixels = (tier: number) => plan.renditions.filter((r) => tierOf(r.name) === tier).reduce((s, r) => s + r.width * r.height, 0);
+    const videoTasks = tasks.filter((t) => t.kind === "video");
+    const total = videoTasks.reduce((s, t) => s + pixels(t.tier), 0) || 1;
+    const encoded = videoTasks.filter((t) => t.status === "done").reduce((s, t) => s + pixels(t.tier), 0);
+    const finished = tasks.every((t) => t.status === "done" || t.status === "failed");
+    const failed = tasks.find((t) => t.status === "failed");
+
+    let status = "processing";
+    let stage: string | null;
+    if (finished) {
+      // A rendition missing a chunk can't be played, but the ones that finished can: keep them, with the error.
+      status = complete.length > 0 ? "ready" : "failed";
+      stage = null;
+    } else {
+      const left = [...plan.renditions].reverse().filter((r) => !complete.includes(r)).map((r) => r.name);
+      const leftTasks = videoTasks.filter((t) => t.status !== "done" && t.status !== "failed").length;
+      stage = `Encoding ${range(left)} (${videoTasks.length - leftTasks}/${videoTasks.length} chunks)`;
+    }
+    await client.query(
+      `UPDATE videos SET
+         renditions = $2, status = $3, stage = $4,
+         progress = CASE WHEN $3 = 'ready' THEN 100 ELSE $5 END,
+         error = CASE WHEN $6::text IS NOT NULL THEN $6 ELSE error END,
+         playable_at = CASE WHEN jsonb_array_length($2::jsonb) > 0 THEN COALESCE(playable_at, now()) END,
+         ready_at = CASE WHEN $3 = 'ready' THEN COALESCE(ready_at, now()) END
+       WHERE id = $1`,
+      [
+        videoId,
+        JSON.stringify(complete.map((r) => summary(r, plan.probe.hasAudio))),
+        status,
+        stage,
+        Math.round(5 + (encoded / total) * 93),
+        failed
+          ? `${failed.kind === "audio" ? "Encoding the audio" : `Encoding chunk ${failed.chunk}`} failed: ${failed.error ?? "unknown error"}`
+          : null,
+      ],
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }

@@ -1,3 +1,4 @@
+import os from "node:os";
 import path from "node:path";
 
 const env = (name: string, fallback: string) => process.env[name] ?? fallback;
@@ -11,6 +12,9 @@ export const config = {
   // 5 MB chunks: small enough that a dropped connection only costs one chunk.
   chunkSize: Number(env("CHUNK_SIZE", String(5 * 1024 * 1024))),
   maxUploadBytes: Number(env("MAX_UPLOAD_BYTES", String(2 * 1024 * 1024 * 1024))),
+  // Chunk tasks one worker process encodes at once. Each gets an equal share of the cores, so the default of one
+  // per core runs four single-threaded encodes on a 4-core machine.
+  encodeConcurrency: Number(env("ENCODE_CONCURRENCY", String(os.availableParallelism()))),
   sessionDays: 30,
   cookieSecure: env("COOKIE_SECURE", "false") === "true",
 };
