@@ -83,10 +83,39 @@ CREATE TABLE IF NOT EXISTS upload_chunks (
   size      integer NOT NULL,
   PRIMARY KEY (upload_id, idx)
 );
+
+-- Every step a video takes through the pipeline, in order: chunks arriving, assembly, each rendition's
+-- segments, publishing. The dashboard animates these live and replays them afterwards (see events.ts).
+CREATE TABLE IF NOT EXISTS pipeline_events (
+  id       bigserial PRIMARY KEY,
+  video_id uuid NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+  at       timestamptz NOT NULL DEFAULT clock_timestamp(),
+  kind     text NOT NULL,
+  data     jsonb NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS pipeline_events_video ON pipeline_events (video_id, id);
+
+-- The worker and the API record events, and the API streams them: NOTIFY tells it which video has new ones.
+CREATE OR REPLACE FUNCTION notify_pipeline_event() RETURNS trigger AS $$
+BEGIN
+  PERFORM pg_notify('pipeline_events', NEW.video_id::text);
+  RETURN NEW;
+END
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE TRIGGER pipeline_events_notify AFTER INSERT ON pipeline_events
+  FOR EACH ROW EXECUTE FUNCTION notify_pipeline_event();
 `;
 
 export async function migrate() {
-  await pool.query(schema);
+  // The API and the worker both migrate on start. The lock keeps them from replacing the same function at once.
+  const client = await pool.connect();
+  try {
+    await client.query("SELECT pg_advisory_lock(7231)");
+    await client.query(schema);
+  } finally {
+    await client.query("SELECT pg_advisory_unlock(7231)").catch(() => {});
+    client.release();
+  }
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

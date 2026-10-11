@@ -3,9 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { paths } from "./config.js";
 import { pool, query } from "./db.js";
-import { enqueueTasks, type ChunkJob } from "./queue.js";
+import { recordEvent } from "./events.js";
+import { CHUNK_QUEUE_NAME, enqueueTasks, QUEUE_NAME, type ChunkJob } from "./queue.js";
 import {
+  audioArgs,
   bandwidthFor,
+  chunkArgs,
   encodeAudio,
   encodeChunk,
   encodeGroups,
@@ -15,6 +18,7 @@ import {
   planChunks,
   planRenditions,
   probe,
+  SEGMENT_SECONDS,
   type Chunk,
   type PlannedRendition,
   type Probe,
@@ -28,6 +32,8 @@ import {
  * 2. runTask (an `encode-chunk` job): encode one tier of one chunk into one segment per rendition, or the audio.
  * 3. syncVideo (after every task): when every chunk of a rendition is done, write its playlist and add it to the
  *    master playlist, which makes it playable.
+ *
+ * Each step records pipeline events (see events.ts), which the dashboard animates live and replays afterwards.
  */
 
 /** What the planner decided, stored on the video so chunk workers never have to re-probe the source. */
@@ -72,16 +78,22 @@ const summary = (r: PlannedRendition, hasAudio: boolean) => ({
  * Step 1. Plan the encode and queue its tasks. Safe to run again, as a retry does: tasks already done are kept and
  * not queued again, so the renditions they published stay up.
  */
-export async function planVideo(videoId: string): Promise<ChunkJob[]> {
+export async function planVideo(videoId: string, job: { attempt?: number; maxAttempts?: number } = {}): Promise<ChunkJob[]> {
   const source = await sourcePath(videoId);
+  const file = path.basename(source);
   const dir = paths.videoDir(videoId);
   await query("UPDATE videos SET status = 'processing', stage = 'Reading file', error = NULL WHERE id = $1", [videoId]);
+  await recordEvent(videoId, "encode_started", {
+    queue: QUEUE_NAME, jobId: videoId, attempt: job.attempt ?? 1, maxAttempts: job.maxAttempts ?? 1, source: file, pid: process.pid,
+  });
   const info = await probe(source);
   await query("UPDATE videos SET duration_seconds = $2, width = $3, height = $4 WHERE id = $1", [
     videoId, info.durationSeconds, info.width, info.height,
   ]);
+  await recordEvent(videoId, "probed", { ...info });
   await query("UPDATE videos SET stage = 'Making thumbnail' WHERE id = $1", [videoId]);
   await makeThumbnail(source, dir, info);
+  await recordEvent(videoId, "thumbnail");
 
   const renditions = planRenditions(info.width, info.height);
   const tiers = encodeGroups(renditions).map((g) => g.map((r) => r.name));
@@ -117,6 +129,28 @@ export async function planVideo(videoId: string): Promise<ChunkJob[]> {
     [videoId],
   );
   const pending = tasks.filter((t) => rows.some((r) => r.kind === t.kind && r.tier === t.tier && r.chunk === t.chunk));
+  // A tier with nothing left to do was finished by an earlier attempt, and its renditions are kept.
+  const tierPending = (tier: number) => pending.some((t) => t.kind === "video" && t.tier === tier);
+  const rungs = (tier: number) => renditions.filter((r) => tiers[tier].includes(r.name));
+  await recordEvent(videoId, "planned", {
+    renditions: renditions.map((r) => {
+      const tier = tiers.findIndex((names) => names.includes(r.name));
+      return {
+        name: r.name, width: r.width, height: r.height, videoKbps: r.videoKbps, bandwidth: bandwidthFor(r, info.hasAudio),
+        codecs: info.hasAudio ? `${r.codec},mp4a.40.2` : r.codec, group: tierPending(tier) ? tier : -1, nice: null,
+      };
+    }),
+    segments: plan.chunks.length,
+    segmentSeconds: SEGMENT_SECONDS,
+    chunks: plan.chunks,
+    tasks: pending.length,
+    queue: CHUNK_QUEUE_NAME,
+    // Each tier's ffmpeg command, shown for chunk 0 with paths relative to the video's folder; every chunk runs the same.
+    groups: tiers
+      .map((names, tier) => ({ tier, renditions: names, nice: 0, priority: tier + 1, command: ["ffmpeg", ...chunkArgs(file, "", plan.chunks[0], rungs(tier), info)] }))
+      .filter((g) => tierPending(g.tier)),
+    audio: info.hasAudio ? { command: ["ffmpeg", ...audioArgs(file, "")], pending: pending.some((t) => t.kind === "audio") } : null,
+  });
   await enqueueTasks(pending);
   await syncVideo(videoId);
   return pending;
@@ -125,7 +159,7 @@ export async function planVideo(videoId: string): Promise<ChunkJob[]> {
 const workerName = `${os.hostname()}:${process.pid}`;
 
 /** Step 2. Encode one task. Its row records who ran it, how long the chunk came out and how many bytes it wrote. */
-export async function runTask(task: ChunkJob, opts: { threads?: number; signal?: AbortSignal } = {}) {
+export async function runTask(task: ChunkJob, opts: { threads?: number; signal?: AbortSignal; attempt?: number } = {}) {
   const { videoId, kind, tier, chunk } = task;
   const key = [videoId, kind, tier, chunk];
   const { rows } = await query<{ encode_plan: EncodePlan | null }>("SELECT encode_plan FROM videos WHERE id = $1", [videoId]);
@@ -140,13 +174,17 @@ export async function runTask(task: ChunkJob, opts: { threads?: number; signal?:
 
   const source = await sourcePath(videoId);
   const dir = paths.videoDir(videoId);
-  let result: { durationSeconds?: number; bytes: number };
+  const names = kind === "audio" ? ["audio"] : plan.tiers[tier];
+  await recordEvent(videoId, "task_started", { kind, tier, chunk, renditions: names, worker: workerName, attempt: opts.attempt ?? 1 });
+  const started = performance.now();
+  let result: { durationSeconds?: number; bytes: number; segments?: { rendition: string; bytes: number }[] };
   if (kind === "audio") {
     result = await encodeAudio(source, dir, opts);
   } else {
     const rs = plan.renditions.filter((r) => plan.tiers[tier].includes(r.name));
     result = await encodeChunk(source, dir, plan.chunks[chunk], rs, plan.probe, opts);
   }
+  const ms = Math.round(performance.now() - started);
   const done = await query(
     `UPDATE encode_tasks SET status = 'done', duration_seconds = $5, bytes = $6, finished_at = now()
      WHERE video_id = $1 AND kind = $2 AND tier = $3 AND chunk = $4`,
@@ -157,6 +195,11 @@ export async function runTask(task: ChunkJob, opts: { threads?: number; signal?:
     await fsp.rm(dir, { recursive: true, force: true });
     return;
   }
+  // A chunk's segments are finished files on disk now, one per rendition in its tier.
+  for (const seg of result.segments ?? []) await recordEvent(videoId, "segment", { rendition: seg.rendition, index: chunk, bytes: seg.bytes });
+  await recordEvent(videoId, "task_done", {
+    kind, tier, chunk, renditions: names, worker: workerName, ms, bytes: result.bytes, durationSeconds: result.durationSeconds ?? null,
+  });
   await syncVideo(videoId);
 }
 
@@ -167,6 +210,9 @@ export async function taskFailed(task: ChunkJob, error: string, final: boolean) 
      WHERE video_id = $1 AND kind = $2 AND tier = $3 AND chunk = $4 AND status <> 'done'`,
     [task.videoId, task.kind, task.tier, task.chunk, final ? "failed" : "queued", error.slice(0, 500)],
   );
+  await recordEvent(task.videoId, "task_failed", {
+    kind: task.kind, tier: task.tier, chunk: task.chunk, error: error.slice(0, 500), final, worker: workerName,
+  });
   if (final) await syncVideo(task.videoId);
 }
 
@@ -178,11 +224,13 @@ const range = (names: string[]) => (names.length === 1 ? names[0] : `${names[0]}
  * chunks at the same moment, exactly one of them sees the rendition complete and publishes it.
  */
 export async function syncVideo(videoId: string) {
+  // Events are recorded after the commit, so the dashboard never shows a rendition the database hasn't published.
+  const events: [string, Record<string, unknown>][] = [];
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const { rows } = await client.query<{ encode_plan: EncodePlan | null; renditions: { name: string }[] }>(
-      "SELECT encode_plan, renditions FROM videos WHERE id = $1 FOR UPDATE",
+    const { rows } = await client.query<{ encode_plan: EncodePlan | null; renditions: { name: string }[]; status: string }>(
+      "SELECT encode_plan, renditions, status FROM videos WHERE id = $1 FOR UPDATE",
       [videoId],
     );
     const plan = rows[0]?.encode_plan;
@@ -251,10 +299,25 @@ export async function syncVideo(videoId: string) {
       ],
     );
     await client.query("COMMIT");
+
+    // Each rendition's share of its tier's chunks that are done, which the dashboard draws as its progress bar.
+    const fractions = Object.fromEntries(
+      plan.renditions.map((r) => {
+        const tier = tierTasks(tierOf(r.name));
+        return [r.name, Number((tier.filter((t) => t.status === "done").length / (plan.chunks.length || 1)).toFixed(4))];
+      }),
+    );
+    events.push(["encode_progress", { fractions }]);
+    if (added.length > 0) events.push(["published", { renditions: complete.map((r) => r.name), added: added.map((r) => r.name) }]);
+    if (status === "ready" && rows[0].status !== "ready") events.push(["ready", {}]);
+    if (status === "failed" && rows[0].status !== "failed") {
+      events.push(["failed", { error: failed?.error ?? "Every rendition is missing a chunk.", final: true }]);
+    }
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;
   } finally {
     client.release();
   }
+  for (const [kind, data] of events) await recordEvent(videoId, kind, data);
 }

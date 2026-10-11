@@ -59,6 +59,9 @@ export function MyVideos() {
             </div>
             <div className="mine__actions">
               <StatusBadge video={v} />
+              <Link className="rl-btn rl-btn--ghost rl-btn--sm" to={`/watch/${v.id}/pipeline`}>
+                {v.status === "ready" || v.status === "failed" ? "Replay" : "Watch live"}
+              </Link>
               {confirming === v.id ? (
                 <span className="mine__confirm">
                   <button className="rl-btn rl-btn--secondary rl-btn--sm" onClick={() => setConfirming(null)}>Keep</button>

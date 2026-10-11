@@ -44,17 +44,21 @@ export async function closeQueues() {
   connections = [];
 }
 
+export const JOB_ATTEMPTS = 2;
+export const JOB_BACKOFF_MS = 5000;
+
 export async function enqueueTranscode(videoId: string) {
   // jobId = videoId makes enqueueing idempotent: completing an upload twice can't encode twice.
   await transcodeQueue().add("transcode", { videoId }, {
     jobId: videoId,
-    attempts: 2,
-    backoff: { type: "fixed", delay: 5000 },
+    attempts: JOB_ATTEMPTS,
+    backoff: { type: "fixed", delay: JOB_BACKOFF_MS },
     removeOnComplete: 100,
     removeOnFail: 100,
   });
 }
 
+export const TASK_ATTEMPTS = 3;
 export const taskJobId = (t: ChunkJob) => `${t.videoId}-${t.kind}-${t.tier}-${t.chunk}`;
 
 /**
@@ -79,7 +83,7 @@ export async function enqueueTasks(tasks: ChunkJob[]) {
       opts: {
         jobId: taskJobId(t),
         priority: priorityFor(t),
-        attempts: 3,
+        attempts: TASK_ATTEMPTS,
         backoff: { type: "fixed", delay: 2000 },
         removeOnComplete: 1000,
         removeOnFail: 1000,

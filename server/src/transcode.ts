@@ -207,18 +207,22 @@ async function segmentSeconds(file: string) {
 /**
  * Encode one chunk into one segment per rendition. Segments are written under a temporary name and renamed only
  * once ffmpeg has finished, so a crash never leaves a half-written segment behind. Returns the chunk's real length
- * (the playlist needs it) and the bytes written.
+ * (the playlist needs it) and the bytes written, in total and per rendition.
  */
 export async function encodeChunk(source: string, outDir: string, chunk: Chunk, rs: PlannedRendition[], src: Probe, opts: RunOptions & { threads?: number } = {}) {
   await Promise.all(rs.map((r) => fsp.mkdir(path.join(outDir, r.name), { recursive: true })));
   await run("ffmpeg", chunkArgs(source, outDir, chunk, rs, src, opts.threads), opts);
-  let bytes = 0;
+  const segments: { rendition: string; bytes: number }[] = [];
   for (const r of rs) {
     const file = path.join(outDir, r.name, segmentName(chunk.index));
     await fsp.rename(`${file}.tmp`, file);
-    bytes += (await fsp.stat(file)).size;
+    segments.push({ rendition: r.name, bytes: (await fsp.stat(file)).size });
   }
-  return { durationSeconds: await segmentSeconds(path.join(outDir, rs[0].name, segmentName(chunk.index))), bytes };
+  return {
+    durationSeconds: await segmentSeconds(path.join(outDir, rs[0].name, segmentName(chunk.index))),
+    bytes: segments.reduce((sum, s) => sum + s.bytes, 0),
+    segments,
+  };
 }
 
 export async function encodeAudio(source: string, outDir: string, opts: RunOptions = {}) {

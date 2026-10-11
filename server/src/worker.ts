@@ -3,6 +3,7 @@ import { pathToFileURL } from "node:url";
 import { Worker, type Job } from "bullmq";
 import { config } from "./config.js";
 import { query } from "./db.js";
+import { recordEvent } from "./events.js";
 import { migrate } from "./migrate.js";
 import { planVideo, runTask, taskFailed } from "./pipeline.js";
 import { CHUNK_QUEUE_NAME, QUEUE_NAME, redisConnection, type ChunkJob, type TranscodeJob } from "./queue.js";
@@ -25,7 +26,7 @@ export function startWorkers(opts: { concurrency?: number; log?: boolean } = {})
     QUEUE_NAME,
     async (job) => {
       log(`planning ${job.data.videoId} (attempt ${job.attemptsMade + 1})`);
-      const tasks = await planVideo(job.data.videoId);
+      const tasks = await planVideo(job.data.videoId, { attempt: job.attemptsMade + 1, maxAttempts: job.opts.attempts ?? 1 });
       log(`queued ${tasks.length} encode tasks for ${job.data.videoId}`);
     },
     { connection: connections[0], concurrency: 2 },
@@ -43,6 +44,7 @@ export function startWorkers(opts: { concurrency?: number; log?: boolean } = {})
        WHERE id = $1`,
       [job.data.videoId, final, err.message.slice(0, 500)],
     );
+    await recordEvent(job.data.videoId, "failed", { error: err.message.slice(0, 500), final });
   });
 
   const encoder = new Worker<ChunkJob>(
@@ -50,7 +52,7 @@ export function startWorkers(opts: { concurrency?: number; log?: boolean } = {})
     async (job) => {
       const t = job.data;
       const started = Date.now();
-      await runTask(t, { threads });
+      await runTask(t, { threads, attempt: job.attemptsMade + 1 });
       log(`encoded ${t.videoId} ${t.kind === "audio" ? "audio" : `tier ${t.tier} chunk ${t.chunk}`} in ${Date.now() - started} ms`);
     },
     { connection: connections[1], concurrency },

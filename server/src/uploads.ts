@@ -6,7 +6,8 @@ import { config, paths } from "./config.js";
 import { query, pool } from "./db.js";
 import { HttpError } from "./errors.js";
 import { requireUser } from "./auth.js";
-import { enqueueTranscode } from "./queue.js";
+import { enqueueTranscode, JOB_ATTEMPTS, JOB_BACKOFF_MS, QUEUE_NAME } from "./queue.js";
+import { recordEvent } from "./events.js";
 
 type UploadRow = {
   id: string;
@@ -94,6 +95,7 @@ uploadsRouter.post("/", async (req, res) => {
     );
     await client.query("COMMIT");
     await fsp.mkdir(paths.uploadDir(upload.rows[0].id), { recursive: true });
+    await recordEvent(video.rows[0].id, "upload_started", { size: body.size, chunkSize: config.chunkSize, totalChunks });
     res.status(201).json(describe(upload.rows[0], []));
   } catch (err) {
     await client.query("ROLLBACK");
@@ -114,6 +116,7 @@ uploadsRouter.put(
   "/:id/chunks/:index",
   express.raw({ type: () => true, limit: config.chunkSize + 1024 }),
   async (req, res) => {
+    const started = performance.now();
     const upload = await loadUpload(String(req.params.id), req.user!.id);
     if (upload.completed_at) throw new HttpError(409, "This upload is already complete.");
     const index = Number(req.params.index);
@@ -137,6 +140,11 @@ uploadsRouter.put(
       "SELECT count(*)::int AS count FROM upload_chunks WHERE upload_id = $1",
       [upload.id],
     );
+    await recordEvent(upload.video_id, "chunk_received", {
+      index, size: body.length, received: rows[0].count, offset: index * upload.chunk_size,
+      // Time the server spent on this request after the body arrived: auth, temp write, rename, two queries.
+      serverMs: Number((performance.now() - started).toFixed(1)),
+    });
     res.json({ index, received: rows[0].count, totalChunks: upload.total_chunks });
   },
 );
@@ -159,6 +167,7 @@ uploadsRouter.post("/:id/complete", async (req, res) => {
   await fsp.mkdir(videoDir, { recursive: true });
   const ext = path.extname(upload.filename).toLowerCase();
   const sourcePath = path.join(videoDir, `source${ext}`);
+  await recordEvent(upload.video_id, "assembly_started", { totalChunks: upload.total_chunks, size: upload.size });
   // Append chunks in index order. Each is at most chunkSize bytes, so reading one at a time keeps memory flat.
   const out = await fsp.open(sourcePath, "w");
   try {
@@ -174,10 +183,13 @@ uploadsRouter.post("/:id/complete", async (req, res) => {
     throw new HttpError(500, `Reassembled file is ${size} bytes, expected ${upload.size}.`);
   }
 
+  await recordEvent(upload.video_id, "assembled", { size, file: `source${ext}` });
   await query("UPDATE uploads SET completed_at = now() WHERE id = $1", [upload.id]);
   await query("UPDATE videos SET status = 'queued', stage = 'Waiting for encoder' WHERE id = $1", [upload.video_id]);
   await fsp.rm(paths.uploadDir(upload.id), { recursive: true, force: true });
   await query("DELETE FROM upload_chunks WHERE upload_id = $1", [upload.id]);
+  // Recorded first, so the worker's first event can't land ahead of it.
+  await recordEvent(upload.video_id, "queued", { queue: QUEUE_NAME, jobId: upload.video_id, attempts: JOB_ATTEMPTS, backoffMs: JOB_BACKOFF_MS });
   await enqueueTranscode(upload.video_id);
   res.json({ videoId: upload.video_id, status: "queued" });
 });
