@@ -1,5 +1,6 @@
 import { DELIVERY, explainEvent, type EdgeId, type NodeId } from "../internals";
 import { formatBytes } from "../format";
+import { EXPLAIN, Explainer, LAYERS } from "./PipelineGuide";
 import { describeEvent, formatElapsed, type PipelineEvent, type PipelineState } from "../pipeline";
 
 /** The system as deployed by docker-compose, laid out left to right in the order a video moves through it. */
@@ -66,9 +67,7 @@ export function Architecture({ event, state, count }: { event: PipelineEvent | n
         <h2 className="type-heading">System</h2>
         <span className="type-timecode pipeline-panel__nums">{event ? event.kind : ""}</span>
       </header>
-      <p className="type-small pipeline-panel__lede">
-        The components docker-compose runs. The ones the current step touches are outlined, with the hops between them moving.
-      </p>
+      <Explainer {...EXPLAIN.system} />
       <div className="arch">
         <svg className="arch__svg" viewBox="0 0 856 302" role="img" aria-label={`System diagram. Active: ${[...activeNodes].join(", ") || "none"}.`}>
           {EDGES.map((e) => {
@@ -114,19 +113,34 @@ export function UnderTheHood({
           <span className="type-small pipeline-panel__nums">latest step · pick one in the log</span>
         )}
       </header>
+      <p className="type-small pipeline-panel__lede">{EXPLAIN.hood.what}</p>
+      <h3 className="type-label hood__section">What happened</h3>
       <p className="type-small hood__title">{describeEvent(event, state.upload?.totalChunks)}</p>
       <p className="type-timecode hood__meta">
         event #{event.id} · {event.kind} · +{formatElapsed(new Date(event.at).getTime() - start)} · {new Date(event.at).toISOString().slice(11, 23)} UTC
       </p>
-      <ol className="hood__ops">
-        {ex.ops.map((op, i) => (
-          <li key={i} className="hood__op">
-            <span className="hood__layer type-label">{op.layer}</span>
-            <code className="hood__code">{op.text}</code>
-          </li>
-        ))}
-      </ol>
-      {ex.why && <p className="type-small hood__why">{ex.why}</p>}
+      {ex.ops.length > 0 && (
+        <>
+          <h3 className="type-label hood__section">Operations, in order</h3>
+          <ol className="hood__ops">
+            {ex.ops.map((op, i) => (
+              <li key={i} className="hood__op">
+                <span className="hood__layer type-label" title={LAYERS[op.layer]}>{op.layer}</span>
+                <code className="hood__code">{op.text}</code>
+              </li>
+            ))}
+          </ol>
+          <p className="type-small hood__legend">
+            {[...new Set(ex.ops.map((o) => o.layer))].map((l) => `${l} is ${LAYERS[l]}`).join(". ")}.
+          </p>
+        </>
+      )}
+      {ex.why && (
+        <>
+          <h3 className="type-label hood__section">Why it works this way</h3>
+          <p className="type-small hood__why">{ex.why}</p>
+        </>
+      )}
       <details className="hood__details">
         <summary className="type-small">How this page heard about it</summary>
         <ol className="hood__delivery type-timecode">
@@ -170,9 +184,7 @@ export function Waterfall({ state, endAt }: { state: PipelineState; endAt: numbe
         <h2 className="type-heading">Timeline</h2>
         <span className="type-timecode pipeline-panel__nums">real time, nothing shortened</span>
       </header>
-      <p className="type-small pipeline-panel__lede">
-        Each bar is a stage; ticks are chunks arriving and segments closing, and the dot is the moment a quality was published. Bars overlap where work runs in parallel.
-      </p>
+      <Explainer {...EXPLAIN.timeline} />
       <div className="wf">
         {rows.map((r) => (
           <div key={r.label} className="wf__row">

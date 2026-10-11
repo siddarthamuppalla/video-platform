@@ -221,6 +221,20 @@ button { font: inherit; }
 .pipeline-commands { display: grid; gap: var(--space-2); }
 .pipeline-commands__title { color: var(--ink-muted); }
 
+/* Explanations */
+.explainer { display: grid; gap: var(--space-2); max-width: 72ch; color: var(--ink-muted); }
+.explainer__label { display: block; margin-bottom: 2px; color: var(--ink); }
+.hood__section { color: var(--ink); margin-top: var(--space-1); }
+.hood__legend { color: var(--ink-muted); }
+.guide { gap: var(--space-2); }
+.guide__summary { cursor: pointer; }
+.guide__steps { margin: var(--space-2) 0 0; padding-left: var(--space-6); display: grid; gap: var(--space-2); color: var(--ink-muted); max-width: 90ch; }
+.guide__steps strong { color: var(--ink); }
+.glossary { margin: 0; display: grid; gap: var(--space-3); }
+.glossary__item { display: grid; gap: 2px; }
+.glossary__term { color: var(--ink); font-weight: 600; }
+.glossary dd { margin: 0; color: var(--ink-muted); }
+
 /* Timeline */
 .wf { --wf-label: 150px; position: relative; display: grid; gap: var(--space-2); }
 .wf__row { display: grid; grid-template-columns: var(--wf-label) minmax(0, 1fr); align-items: center; min-height: 18px; }

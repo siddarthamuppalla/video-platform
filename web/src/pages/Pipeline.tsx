@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { api, type Video } from "../api";
 import { formatBytes, formatDuration } from "../format";
 import { Architecture, UnderTheHood, Waterfall } from "./PipelineInternals";
+import { EXPLAIN, Explainer, Glossary, ReadingGuide } from "./PipelineGuide";
 import {
   STAGES,
   describeEvent,
@@ -175,6 +176,7 @@ export function Pipeline() {
         </div>
       ) : (
         <>
+          <ReadingGuide />
           <Transport
             live={live}
             following={following}
@@ -215,6 +217,7 @@ export function Pipeline() {
             <aside className="pipeline__side">
               <PlaylistPanel lanes={state.lanes} />
               <EventLog events={events} count={count} state={state} selectedId={focus?.id ?? null} onSelect={setSelectedId} />
+              <Glossary />
             </aside>
           </div>
         </>
@@ -415,11 +418,7 @@ function UploadPanel({ state }: { state: PipelineState }) {
           {u && u.resent > 0 ? ` · ${u.resent} re-sent` : ""}
         </span>
       </header>
-      <p className="type-small pipeline-panel__lede">
-        {u
-          ? `The browser sends the file in ${formatBytes(u.chunkSize)} chunks, three at a time and in any order. Each one is saved on its own, so a dropped connection only costs that chunk.`
-          : "Waiting for the browser to start sending."}
-      </p>
+      <Explainer {...EXPLAIN.upload(u ? formatBytes(u.chunkSize) : "fixed-size")} />
       {u && (
         <ul className={`pipeline-chunks${assembled ? " pipeline-chunks--merged" : ""}`} aria-label={`${u.chunks.filter((c) => c > 0).length} of ${u.totalChunks} chunks received`}>
           {u.chunks.map((c, i) => (
@@ -502,6 +501,7 @@ function InspectPanel({ state, videoId }: { state: PipelineState; videoId: strin
           <dt>Thumbnail</dt>
           <dd className="type-timecode">{state.thumbnail ? "captured 10% in" : "Not yet"}</dd>
         </dl>
+        <Explainer {...EXPLAIN.inspect} />
         {state.failed && !state.failed.final && <p className="type-small pipeline-inspect__error">Attempt failed: {state.failed.error} It will be retried.</p>}
       </div>
     </section>
@@ -515,11 +515,7 @@ function EncodePanel({ state, fractions }: { state: PipelineState; fractions: Ma
         <h2 className="type-heading">Encoding</h2>
         <span className="type-timecode pipeline-panel__nums">{state.lanes.length ? `${state.lanes.length} qualities` : ""}</span>
       </header>
-      <p className="type-small pipeline-panel__lede">
-        The smallest quality is encoded on its own first, so the video can play within moments. The larger ones share one
-        ffmpeg run that decodes the source once, at a lower CPU priority. Each quality is cut into {state.segmentSeconds} second
-        segments at the same timestamps, so players can switch between them at any boundary.
-      </p>
+      <Explainer {...EXPLAIN.encode(state.segmentSeconds)} />
       {state.lanes.length === 0 ? (
         <p className="type-small pipeline-panel__empty">The plan appears once the encoder has read the file.</p>
       ) : (
@@ -653,9 +649,7 @@ function PlaylistPanel({ lanes }: { lanes: Lane[] }) {
       <header className="pipeline-panel__head">
         <h2 className="type-heading">master.m3u8</h2>
       </header>
-      <p className="type-small pipeline-panel__lede">
-        The player loads this file first. Each quality is added the moment it finishes, and the player picks between them by bandwidth.
-      </p>
+      <Explainer {...EXPLAIN.playlist} />
       <pre className="pipeline-playlist type-timecode">
         {lines.length > 2 ? (
           lines.map((line, i) => <span key={line} className={`pipeline-playlist__line${i >= 2 ? " pipeline-playlist__line--added" : ""}`}>{line}{"\n"}</span>)
@@ -696,6 +690,7 @@ function EventLog({
         <h2 className="type-heading">Event log</h2>
         <span className="type-timecode pipeline-panel__nums">{count} / {events.length}</span>
       </header>
+      <p className="type-small pipeline-panel__lede">{EXPLAIN.log.what}</p>
       <ol className="pipeline-log">
         {rows.map(({ e, text }, i) => (
           <li key={e.id}>
