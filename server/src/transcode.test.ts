@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bandwidthFor, encodeArgs, encodeGroups, masterPlaylist, planRenditions } from "./transcode.js";
+import { bandwidthFor, encodeArgs, encodeGroups, masterPlaylist, planRenditions, segmentTracker } from "./transcode.js";
 
 const summary = (w: number, h: number) => planRenditions(w, h).map((r) => `${r.name} ${r.width}x${r.height}`);
 
@@ -106,5 +106,19 @@ describe("encodeArgs", () => {
     expect(args).not.toContain("-filter_complex");
     expect(args[args.indexOf("-vf") + 1]).toBe("scale=640:360");
     expect(args).not.toContain("0:a:0");
+  });
+});
+
+describe("segmentTracker", () => {
+  it("reports each segment once the next one opens, and the last ones when ffmpeg exits", () => {
+    const done: string[] = [];
+    const t = segmentTracker((r, i) => done.push(`${r}/${i}`));
+    // ffmpeg's log arrives in arbitrary pieces, interleaved across outputs.
+    t.feed("[hls @ 0x1] Opening '/data/videos/abc/360p/segment_0000.ts' for writing\n[hls @ 0x2] Opening '/data/videos/abc/720p/seg");
+    t.feed("ment_0000.ts' for writing\n[hls @ 0x1] Opening '/data/videos/abc/360p/segment_0001.ts' for writing\n");
+    expect(done).toEqual(["360p/0"]);
+    t.feed("frame= 100\n[hls @ 0x1] Opening '/data/videos/abc/360p/index.m3u8.tmp' for writing\n");
+    t.finish();
+    expect(done).toEqual(["360p/0", "360p/1", "720p/0"]);
   });
 });

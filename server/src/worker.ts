@@ -1,5 +1,6 @@
 import { Worker, type Job } from "bullmq";
 import { query } from "./db.js";
+import { recordEvent } from "./events.js";
 import { migrate } from "./migrate.js";
 import { processVideo } from "./pipeline.js";
 import { QUEUE_NAME, redisConnection, type TranscodeJob } from "./queue.js";
@@ -30,6 +31,7 @@ worker.on("failed", async (job, err) => {
      WHERE id = $1`,
     [job.data.videoId, final, err.message.slice(0, 500)],
   );
+  await recordEvent(job.data.videoId, "failed", { error: err.message.slice(0, 500), final });
 });
 
 console.log("worker waiting for jobs");

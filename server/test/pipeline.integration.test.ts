@@ -16,6 +16,7 @@ const { migrate } = await import("../src/migrate.js");
 const { pool } = await import("../src/db.js");
 const { processVideo } = await import("../src/pipeline.js");
 const { transcodeQueue } = await import("../src/queue.js");
+const { closeListener, recordEvent } = await import("../src/events.js");
 
 const sample = path.join(storage, "sample.mp4");
 const agent = request.agent(createApp());
@@ -33,6 +34,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await transcodeQueue().close();
+  await closeListener();
   await pool.end();
   fs.rmSync(storage, { recursive: true, force: true });
 });
@@ -150,6 +152,76 @@ describe("upload to playback", () => {
 
   it("keeps the original upload private", async () => {
     await agent.get(`/media/${videoId}/source.mp4`).expect(404);
+  });
+
+  it("records every pipeline step in order for the dashboard to replay", async () => {
+    const { body } = await agent.get(`/api/videos/${videoId}/pipeline`).expect(200);
+    type Ev = { id: number; at: string; kind: string; data: any };
+    const events: Ev[] = body.events;
+    const kinds = events.map((e) => e.kind);
+    const first = (kind: string) => kinds.indexOf(kind);
+
+    // The upload: one event per chunk PUT, including the one rejected-size chunk never recorded.
+    expect(kinds[0]).toBe("upload_started");
+    expect(events[0].data.totalChunks).toBe(totalChunks);
+    const chunks = events.filter((e) => e.kind === "chunk_received");
+    expect(chunks.map((e) => e.data.index).sort((a, b) => a - b)).toEqual(Array.from({ length: totalChunks }, (_, i) => i));
+    expect(chunks[chunks.length - 1].data.received).toBe(totalChunks);
+
+    // Then assembly, the queue and the first encode, in that order.
+    const order = ["assembly_started", "assembled", "queued", "encode_started", "probed", "thumbnail", "planned"].map(first);
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    const planned = events.find((e) => e.kind === "planned")!;
+    expect(planned.data.segments).toBe(2);
+    expect(planned.data.renditions.map((r: any) => [r.name, r.group])).toEqual([["720p", 1], ["360p", 0]]);
+
+    // Both renditions' two segments, each before its rendition is published; 360p is published first.
+    const firstRun = events.slice(0, events.findIndex((e) => e.kind === "ready") + 1);
+    const segments = (name: string) => firstRun.filter((e) => e.kind === "segment" && e.data.rendition === name);
+    for (const name of ["360p", "720p"]) {
+      expect(segments(name).map((e) => e.data.index)).toEqual([0, 1]);
+      expect(segments(name).every((e) => e.data.bytes > 0)).toBe(true);
+      const published = firstRun.findIndex((e) => e.kind === "published" && e.data.added.includes(name));
+      expect(firstRun.indexOf(segments(name)[1])).toBeLessThan(published);
+    }
+    expect(firstRun.filter((e) => e.kind === "published").map((e) => e.data.added)).toEqual([["360p"], ["720p"]]);
+
+    // The rerun above shows up as a second attempt that keeps both renditions.
+    expect(kinds.filter((k) => k === "encode_started")).toHaveLength(2);
+    expect(events.filter((e) => e.kind === "planned")[1].data.renditions.every((r: any) => r.group === -1)).toBe(true);
+    expect(kinds[kinds.length - 1]).toBe("ready");
+
+    // Timestamps never go backwards.
+    const times = events.map((e) => new Date(e.at).getTime());
+    expect(times.every((t, i) => i === 0 || t >= times[i - 1])).toBe(true);
+  });
+
+  it("streams events live, picking up after the last one the browser saw", async () => {
+    const server = createApp().listen(0);
+    const { port } = server.address() as { port: number };
+    const { body } = await agent.get(`/api/videos/${videoId}/pipeline`).expect(200);
+    const lastId = body.events[body.events.length - 1].id;
+    const controller = new AbortController();
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/videos/${videoId}/pipeline/live?after=${lastId}`, { signal: controller.signal });
+      expect(res.headers.get("content-type")).toContain("text/event-stream");
+      const reader = res.body!.pipeThrough(new TextDecoderStream()).getReader();
+      let text = "";
+      const next = async () => {
+        while (!text.includes("data:")) text += (await reader.read()).value ?? "";
+      };
+      // Nothing new yet; record an event and it should arrive over the open stream.
+      setTimeout(() => void recordEvent(videoId, "encode_started"), 100);
+      await next();
+      const event = JSON.parse(/data: (.*)/.exec(text)![1]);
+      expect(event.kind).toBe("encode_started");
+      expect(event.id).toBeGreaterThan(lastId);
+      expect(text).toContain(`id: ${event.id}`);
+    } finally {
+      controller.abort();
+      server.close();
+    }
   });
 
   it("lists the finished video publicly", async () => {

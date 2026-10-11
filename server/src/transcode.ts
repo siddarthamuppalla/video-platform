@@ -66,7 +66,7 @@ export function masterPlaylist(renditions: PlannedRendition[], hasAudio: boolean
   return lines.join("\n") + "\n";
 }
 
-type RunOptions = { nice?: number; signal?: AbortSignal };
+type RunOptions = { nice?: number; signal?: AbortSignal; onStderr?: (chunk: string) => void };
 
 function run(cmd: string, args: string[], onStdout?: (chunk: string) => void, opts: RunOptions = {}) {
   return new Promise<string>((resolve, reject) => {
@@ -81,6 +81,7 @@ function run(cmd: string, args: string[], onStdout?: (chunk: string) => void, op
     });
     child.stderr.setEncoding("utf8").on("data", (d: string) => {
       err = (err + d).slice(-4000);
+      opts.onStderr?.(d);
     });
     child.on("error", reject);
     child.on("close", (code) => {
@@ -143,6 +144,35 @@ export function encodeArgs(source: string, outDir: string, rs: PlannedRendition[
 }
 
 /**
+ * Turns ffmpeg's log into "segment finished" calls. The HLS muxer logs `Opening '.../720p/segment_0003.ts'
+ * for writing` as it starts each segment, which means the one before it is complete; the last segment of
+ * each rendition is complete when ffmpeg exits, which is what `finish` reports.
+ */
+export function segmentTracker(onSegment: (rendition: string, index: number) => void) {
+  const opened = new Map<string, number>();
+  let buffer = "";
+  return {
+    feed(chunk: string) {
+      buffer += chunk;
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const m = /Opening '[^']*?([^/\\']+)[/\\]segment_(\d+)\.ts' for writing/.exec(line);
+        if (!m) continue;
+        const [, rendition, n] = m;
+        const index = Number(n);
+        opened.set(rendition, index);
+        if (index > 0) onSegment(rendition, index - 1);
+      }
+    },
+    finish() {
+      for (const [rendition, index] of opened) onSegment(rendition, index);
+      opened.clear();
+    },
+  };
+}
+
+/**
  * Encode one or more renditions to HLS in a single ffmpeg run. All outputs advance together, so they
  * finish together. `nice` runs it at a lower CPU priority (see processVideo).
  */
@@ -152,9 +182,10 @@ export async function encodeRenditions(
   rs: PlannedRendition[],
   src: Probe,
   onProgress: (fraction: number) => void,
-  opts: RunOptions = {},
+  opts: RunOptions & { onSegment?: (rendition: string, index: number) => void } = {},
 ) {
   await Promise.all(rs.map((r) => fsp.mkdir(path.join(outDir, r.name), { recursive: true })));
+  const segments = segmentTracker((rendition, index) => opts.onSegment?.(rendition, index));
   let buffer = "";
   await run(
     "ffmpeg",
@@ -168,8 +199,9 @@ export async function encodeRenditions(
         buffer = buffer.slice(buffer.lastIndexOf("out_time_us="));
       }
     },
-    opts,
+    { ...opts, onStderr: (chunk) => segments.feed(chunk) },
   );
+  segments.finish();
   onProgress(1);
 }
 
