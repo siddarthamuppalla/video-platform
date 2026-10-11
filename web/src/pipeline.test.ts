@@ -133,3 +133,15 @@ describe("replay clock", () => {
     expect(f.get("720p")).toBeCloseTo(0.4);
   });
 });
+
+describe("explainEvent", () => {
+  it("maps a chunk to the request, the atomic write and the upsert behind it", async () => {
+    const { explainEvent } = await import("./internals");
+    const chunk = ev(400, "chunk_received", { index: 1, size: 256, received: 3, offset: 256, serverMs: 2.5 });
+    const ex = explainEvent(chunk, pipelineState(events, 4));
+    expect(ex.edges).toEqual(["browser-nginx", "nginx-api", "api-disk", "api-postgres"]);
+    expect(ex.ops.find((o) => o.layer === "HTTP")?.text).toContain("bytes 256–511");
+    expect(ex.ops.some((o) => o.layer === "SQL" && o.text.includes("ON CONFLICT"))).toBe(true);
+    expect(ex.why).toContain("2.5 ms");
+  });
+});

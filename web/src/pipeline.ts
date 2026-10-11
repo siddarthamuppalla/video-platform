@@ -21,6 +21,10 @@ export type Lane = {
   fraction: number;
   /** Bytes of each finished segment, or null while it is still being written. */
   segments: (number | null)[];
+  /** When each segment finished (ms since epoch). */
+  segmentAt: (number | null)[];
+  /** When this rendition's encode began: the plan that scheduled it. */
+  startedAt: number | null;
   segmentsDone: number;
   publishedAt: number | null;
 };
@@ -44,6 +48,11 @@ export type PipelineState = {
     chunkSize: number;
     totalChunks: number;
     chunks: ChunkState[];
+    /** Server time spent on each chunk's PUT, in ms (the latest attempt). */
+    chunkMs: (number | null)[];
+    /** When each chunk first arrived (ms since epoch). */
+    chunkAt: (number | null)[];
+    requests: number;
     received: number;
     bytes: number;
     resent: number;
@@ -53,6 +62,9 @@ export type PipelineState = {
   };
   assembly: null | { startedAt: number; doneAt: number | null; size: number };
   queuedAt: number | null;
+  job: null | { queue: string; jobId: string; maxAttempts: number; backoffMs: number; attempt: number; pid: number | null; source: string | null };
+  /** The ffmpeg runs of the latest plan, with their exact arguments. */
+  groups: { renditions: string[]; nice: number; command: string[] }[];
   attempts: number;
   encodeStartedAt: number | null;
   plannedAt: number | null;
@@ -75,6 +87,8 @@ const empty = (): PipelineState => ({
   upload: null,
   assembly: null,
   queuedAt: null,
+  job: null,
+  groups: [],
   attempts: 0,
   encodeStartedAt: null,
   plannedAt: null,
@@ -108,6 +122,9 @@ function apply(s: PipelineState, e: PipelineEvent, i: number) {
         chunkSize: d.chunkSize,
         totalChunks: d.totalChunks,
         chunks: Array.from({ length: d.totalChunks }, () => 0 as ChunkState),
+        chunkMs: Array.from({ length: d.totalChunks }, () => null),
+        chunkAt: Array.from({ length: d.totalChunks }, () => null),
+        requests: 0,
         received: 0,
         bytes: 0,
         resent: 0,
@@ -121,11 +138,14 @@ function apply(s: PipelineState, e: PipelineEvent, i: number) {
       if (!u || d.index < 0 || d.index >= u.totalChunks) break;
       if (u.chunks[d.index] === 0) {
         u.chunks[d.index] = 1;
+        u.chunkAt[d.index] = at;
         u.bytes += d.size;
       } else {
         u.resent++;
       }
       u.received = d.received;
+      u.requests++;
+      if (typeof d.serverMs === "number") u.chunkMs[d.index] = d.serverMs;
       u.lastIndex = d.index;
       u.lastAt = at;
       break;
@@ -141,11 +161,13 @@ function apply(s: PipelineState, e: PipelineEvent, i: number) {
     case "queued":
       s.stage = "queue";
       s.queuedAt = at;
+      s.job = { queue: d.queue ?? "transcode", jobId: d.jobId ?? "", maxAttempts: d.attempts ?? 1, backoffMs: d.backoffMs ?? 0, attempt: 0, pid: null, source: null };
       break;
     case "encode_started":
       s.stage = "probe";
       s.attempts++;
       s.encodeStartedAt = at;
+      if (s.job) Object.assign(s.job, { attempt: d.attempt ?? s.attempts, pid: d.pid ?? null, source: d.source ?? null });
       s.failed = null;
       break;
     case "probed":
@@ -159,6 +181,7 @@ function apply(s: PipelineState, e: PipelineEvent, i: number) {
       s.plannedAt = at;
       s.segmentSeconds = d.segmentSeconds;
       s.segmentCount = d.segments;
+      s.groups = d.groups ?? [];
       const previous = new Map(s.lanes.map((l) => [l.name, l]));
       s.lanes = (d.renditions as any[])
         .map((r): Lane => {
@@ -178,6 +201,10 @@ function apply(s: PipelineState, e: PipelineEvent, i: number) {
             segments: kept
               ? Array.from({ length: d.segments }, (_, k) => before?.segments[k] ?? 0)
               : Array.from({ length: d.segments }, () => null),
+            segmentAt: kept
+              ? Array.from({ length: d.segments }, (_, k) => before?.segmentAt[k] ?? null)
+              : Array.from({ length: d.segments }, () => null),
+            startedAt: kept ? (before?.startedAt ?? null) : at,
             segmentsDone: kept ? d.segments : 0,
             publishedAt: kept ? (before?.publishedAt ?? null) : null,
           };
@@ -198,6 +225,7 @@ function apply(s: PipelineState, e: PipelineEvent, i: number) {
       if (!lane || d.index < 0 || d.index >= lane.segments.length) break;
       if (lane.segments[d.index] === null) lane.segmentsDone++;
       lane.segments[d.index] = d.bytes ?? 0;
+      lane.segmentAt[d.index] = at;
       break;
     }
     case "published":
@@ -218,6 +246,26 @@ function apply(s: PipelineState, e: PipelineEvent, i: number) {
       if (d.final) s.stage = "failed";
       break;
   }
+}
+
+/**
+ * How a lane is doing, from what has been recorded: how fast ffmpeg is going relative to the video's own
+ * length, and the bitrate the written segments actually came out at versus the rung's target.
+ */
+export function laneMetrics(lane: Lane, fraction: number, durationSeconds: number, segmentSeconds: number, now: number | null) {
+  const end = lane.publishedAt ?? now;
+  const elapsed = lane.startedAt !== null && end !== null ? (end - lane.startedAt) / 1000 : 0;
+  const speed = elapsed > 0 && lane.group >= 0 ? (fraction * durationSeconds) / elapsed : null;
+  let bytes = 0;
+  let seconds = 0;
+  lane.segments.forEach((b, k) => {
+    if (b === null || b === 0) return;
+    bytes += b;
+    // Every segment is segmentSeconds long except the last, which holds the remainder.
+    seconds += k === lane.segments.length - 1 ? durationSeconds - k * segmentSeconds : segmentSeconds;
+  });
+  const kbps = seconds > 0 ? (bytes * 8) / seconds / 1000 : null;
+  return { speed, kbps, bytes };
 }
 
 /** The renditions in the master playlist so far, listed the way the server writes it (largest first). */

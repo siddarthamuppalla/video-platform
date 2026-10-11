@@ -7,15 +7,16 @@ import { query } from "./db.js";
  * The same rows drive the live dashboard (streamed as they land) and the replay afterwards.
  *
  *   upload_started    { size, chunkSize, totalChunks }
- *   chunk_received    { index, size, received }          one per chunk PUT, so a re-sent chunk shows twice
+ *   chunk_received    { index, size, received, offset, serverMs }   one per chunk PUT, so a re-sent chunk shows twice
  *   assembly_started  { totalChunks, size }
- *   assembled         { size }
- *   queued            {}
- *   encode_started    {}                                  once per attempt
+ *   assembled         { size, file }
+ *   queued            { queue, jobId, attempts, backoffMs }
+ *   encode_started    { queue, jobId, attempt, maxAttempts, source, pid }   once per attempt
  *   probed            { width, height, durationSeconds, hasAudio }
  *   thumbnail         {}
  *   planned           { renditions: [{ name, width, height, videoKbps, bandwidth, codecs, group, nice }], segments, segmentSeconds }
- *                     group is the encode group (0 runs first and alone), or -1 if a retry kept it
+ *                     group is the encode group (0 runs first and alone), or -1 if a retry kept it;
+ *                     groups: [{ renditions, nice, command }] is each ffmpeg run's exact arguments
  *   encode_progress   { fractions: { [rendition]: 0..1 } }   at most once a second
  *   segment           { rendition, index, bytes }         an HLS segment finished writing
  *   published         { renditions, added }               these renditions joined the master playlist

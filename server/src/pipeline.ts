@@ -4,8 +4,10 @@ import path from "node:path";
 import { paths } from "./config.js";
 import { query } from "./db.js";
 import { recordEvent } from "./events.js";
+import { QUEUE_NAME } from "./queue.js";
 import {
   bandwidthFor,
+  encodeArgs,
   encodeRenditions,
   encodeGroups,
   makeThumbnail,
@@ -40,7 +42,7 @@ const summary = (r: PlannedRendition, hasAudio: boolean) => ({
   bandwidth: bandwidthFor(r, hasAudio),
 });
 
-export async function processVideo(videoId: string) {
+export async function processVideo(videoId: string, job: { attempt?: number; maxAttempts?: number } = {}) {
   const dir = paths.videoDir(videoId);
   const source = (await fsp.readdir(dir)).find((f) => f.startsWith("source."));
   if (!source) throw new Error("The uploaded file is missing.");
@@ -48,7 +50,9 @@ export async function processVideo(videoId: string) {
 
   const { rows } = await query<{ renditions: { name: string }[] }>("SELECT renditions FROM videos WHERE id = $1", [videoId]);
   await query("UPDATE videos SET status = 'processing', progress = 0, stage = 'Reading file', error = NULL WHERE id = $1", [videoId]);
-  await recordEvent(videoId, "encode_started");
+  await recordEvent(videoId, "encode_started", {
+    queue: QUEUE_NAME, jobId: videoId, attempt: job.attempt ?? 1, maxAttempts: job.maxAttempts ?? 1, source: source, pid: process.pid,
+  });
   const info = await probe(sourcePath);
   await query("UPDATE videos SET duration_seconds = $2, width = $3, height = $4 WHERE id = $1", [
     videoId, info.durationSeconds, info.width, info.height,
@@ -77,6 +81,12 @@ export async function processVideo(videoId: string) {
     }),
     segments: Math.ceil(info.durationSeconds / SEGMENT_SECONDS),
     segmentSeconds: SEGMENT_SECONDS,
+    // The exact ffmpeg invocation per encode group, with paths relative to the video's folder.
+    groups: groups.map((g, i) => ({
+      renditions: g.map((r) => r.name),
+      nice: niceFor(i),
+      command: ["ffmpeg", ...encodeArgs(source, "", g, info)],
+    })),
   });
 
   // Weight each rendition by pixel count so the bar moves at an even pace.

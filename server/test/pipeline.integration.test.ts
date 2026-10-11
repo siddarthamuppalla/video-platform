@@ -175,6 +175,12 @@ describe("upload to playback", () => {
     const planned = events.find((e) => e.kind === "planned")!;
     expect(planned.data.segments).toBe(2);
     expect(planned.data.renditions.map((r: any) => [r.name, r.group])).toEqual([["720p", 1], ["360p", 0]]);
+    // The exact ffmpeg runs, paths relative to the video folder: 360p alone, then 720p at a lower priority.
+    expect(planned.data.groups.map((g: any) => [g.renditions, g.nice])).toEqual([[["360p"], 0], [["720p"], 10]]);
+    expect(planned.data.groups[0].command).toContain("360p/index.m3u8");
+    expect(planned.data.groups[0].command.join(" ")).not.toContain(storage);
+    expect(events.find((e) => e.kind === "queued")!.data).toMatchObject({ queue: "transcode", jobId: videoId, attempts: 2 });
+    expect(chunks.every((e) => e.data.offset === e.data.index * chunkSize && e.data.serverMs >= 0)).toBe(true);
 
     // Both renditions' two segments, each before its rendition is published; 360p is published first.
     const firstRun = events.slice(0, events.findIndex((e) => e.kind === "ready") + 1);

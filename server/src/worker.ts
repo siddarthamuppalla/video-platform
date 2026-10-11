@@ -7,7 +7,7 @@ import { QUEUE_NAME, redisConnection, type TranscodeJob } from "./queue.js";
 
 async function handle(job: Job<TranscodeJob>) {
   console.log(`encoding ${job.data.videoId} (attempt ${job.attemptsMade + 1})`);
-  await processVideo(job.data.videoId);
+  await processVideo(job.data.videoId, { attempt: job.attemptsMade + 1, maxAttempts: job.opts.attempts ?? 1 });
   console.log(`ready ${job.data.videoId}`);
 }
 

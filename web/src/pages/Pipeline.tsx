@@ -2,12 +2,14 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, type Video } from "../api";
 import { formatBytes, formatDuration } from "../format";
+import { Architecture, UnderTheHood, Waterfall } from "./PipelineInternals";
 import {
   STAGES,
   describeEvent,
   eventsBy,
   formatElapsed,
   interpolatedFractions,
+  laneMetrics,
   masterPlaylistLines,
   pipelineState,
   replayTimes,
@@ -40,12 +42,15 @@ export function Pipeline() {
   const [t, setT] = useState(0);
   const [speed, setSpeed] = useState(1);
   const [skipIdle, setSkipIdle] = useState(true);
+  // The event "Under the hood" explains: one picked in the log, or else the latest step.
+  const [selectedId, setSelectedId] = useState<number | null>(null);
 
   useEffect(() => {
     setVideo(null);
     setEvents(null);
     setError(null);
     setLive(false);
+    setSelectedId(null);
     tRef.current = 0;
     setT(0);
     let source: EventSource | undefined;
@@ -89,6 +94,13 @@ export function Pipeline() {
   const playhead = following ? total : Math.min(t, total);
   const count = following ? list.length : eventsBy(times, playhead);
   const state = useMemo(() => pipelineState(list, count), [list, count]);
+  const shown = list.slice(0, count);
+  const picked = selectedId !== null ? (shown.find((e) => e.id === selectedId) ?? null) : null;
+  // Progress ticks arrive every second and say little; the latest real step is more useful to explain.
+  let latest: PipelineEvent | null = null;
+  for (let i = shown.length - 1; i >= 0 && !latest; i--) if (shown[i].kind !== "encode_progress") latest = shown[i];
+  const focus = picked ?? latest;
+  const endAt = list.length ? new Date(list[list.length - 1].at).getTime() : 0;
   const fractions = following ? new Map(state.lanes.map((l) => [l.name, l.fraction])) : interpolatedFractions(state, list, times, count, playhead);
 
   // The replay clock. `tRef` is its source of truth so each frame advances from the last one, not from
@@ -184,16 +196,25 @@ export function Pipeline() {
             onSkipIdle={toggleSkipIdle}
           />
           <StageRail state={state} />
+          <div className="pipeline__grid">
+            <div className="pipeline__main">
+              <Architecture event={focus} state={state} count={count} />
+            </div>
+            <aside className="pipeline__side">
+              <UnderTheHood event={focus} state={state} pinned={picked !== null} onFollow={() => setSelectedId(null)} />
+            </aside>
+          </div>
           <Stats state={state} />
           <div className="pipeline__grid">
             <div className="pipeline__main">
               <UploadPanel state={state} />
               <InspectPanel state={state} videoId={video.id} />
               <EncodePanel state={state} fractions={fractions} />
+              <Waterfall state={state} endAt={endAt} />
             </div>
             <aside className="pipeline__side">
               <PlaylistPanel lanes={state.lanes} />
-              <EventLog events={events} count={count} state={state} />
+              <EventLog events={events} count={count} state={state} selectedId={focus?.id ?? null} onSelect={setSelectedId} />
             </aside>
           </div>
         </>
@@ -407,11 +428,12 @@ function UploadPanel({ state }: { state: PipelineState }) {
               className={`pipeline-chunk pipeline-chunk--${c === 0 ? "waiting" : c === 1 ? "received" : "merged"}${u.lastIndex === i && c === 1 ? " pipeline-chunk--latest" : ""}`}
               // The merge sweeps left to right, in the order the chunks are stitched together.
               style={c === 2 ? { transitionDelay: `${Math.round((i / u.totalChunks) * 600)}ms` } : undefined}
-              title={`Chunk ${i}`}
+              title={`Chunk ${i} · bytes ${i * u.chunkSize}–${Math.min(u.size, (i + 1) * u.chunkSize) - 1}${u.chunkMs[i] != null ? ` · server ${u.chunkMs[i]} ms` : ""}`}
             />
           ))}
         </ul>
       )}
+      {u && <UploadNumbers state={state} />}
       {u && (
         <div className="pipeline-source">
           <div className="pipeline-source__row type-small">
@@ -426,6 +448,27 @@ function UploadPanel({ state }: { state: PipelineState }) {
         </div>
       )}
     </section>
+  );
+}
+
+function UploadNumbers({ state }: { state: PipelineState }) {
+  const u = state.upload!;
+  const ms = u.chunkMs.filter((m): m is number => m !== null).sort((a, b) => a - b);
+  const p = (q: number) => ms[Math.min(ms.length - 1, Math.floor(q * ms.length))];
+  const elapsed = u.lastAt - u.startedAt;
+  return (
+    <dl className="pipeline-facts type-small">
+      <dt>Requests</dt>
+      <dd className="type-timecode">
+        POST /uploads · {u.requests} × PUT /chunks/:i{u.resent ? ` (${u.resent} re-sent)` : ""}{state.assembly ? " · POST /complete" : ""}
+      </dd>
+      <dt>Server time</dt>
+      <dd className="type-timecode">{ms.length ? `p50 ${p(0.5)} ms · p95 ${p(0.95)} ms · max ${ms[ms.length - 1]} ms per chunk` : "No chunks yet"}</dd>
+      <dt>Throughput</dt>
+      <dd className="type-timecode">
+        {elapsed > 0 ? `${formatBytes((u.bytes / elapsed) * 1000)}/s over ${formatElapsed(elapsed)} · ${((u.received / elapsed) * 1000).toFixed(1)} chunks/s` : "Measuring"} · 3 in flight
+      </dd>
+    </dl>
   );
 }
 
@@ -445,6 +488,15 @@ function InspectPanel({ state, videoId }: { state: PipelineState; videoId: strin
         <dl className="pipeline-facts type-small">
           <dt>Queue</dt>
           <dd className="type-timecode">{state.queuedAt === null ? "Not yet" : waited === null ? "Waiting for the encoder" : `waited ${formatElapsed(waited)}`}</dd>
+          {state.job && (
+            <>
+              <dt>Job</dt>
+              <dd className="type-timecode">
+                BullMQ "{state.job.queue}" · jobId {state.job.jobId.slice(0, 8)}… · attempt {state.job.attempt || "–"} of {state.job.maxAttempts} · backoff {state.job.backoffMs / 1000} s
+                {state.job.pid ? ` · worker pid ${state.job.pid}` : ""}
+              </dd>
+            </>
+          )}
           <dt>Source</dt>
           <dd className="type-timecode">{p ? `${p.width}×${p.height} · ${formatDuration(p.durationSeconds)} · ${p.hasAudio ? "audio" : "no audio"}` : "Not read yet"}</dd>
           <dt>Thumbnail</dt>
@@ -480,12 +532,43 @@ function EncodePanel({ state, fractions }: { state: PipelineState; fractions: Ma
               segmentSeconds={state.segmentSeconds}
               duration={state.probe?.durationSeconds ?? 0}
               since={state.plannedAt}
+              now={state.now}
             />
           ))}
         </ul>
       )}
+      {state.groups.length > 0 && (
+        <div className="pipeline-commands">
+          <h3 className="type-label pipeline-commands__title">ffmpeg runs</h3>
+          {state.groups.map((g, i) => (
+            <details key={i} className="hood__details">
+              <summary className="type-small">
+                Run {i + 1}: {g.renditions.join(", ")} · {g.nice ? `nice ${g.nice}` : "full priority"}
+              </summary>
+              <pre className="hood__json type-timecode">{formatCommand(g.command, g.nice)}</pre>
+            </details>
+          ))}
+        </div>
+      )}
     </section>
   );
+}
+
+/** One option per line, the way you would write it in a shell script. */
+function formatCommand(argv: string[], nice: number) {
+  const lines: string[] = [nice ? `nice -n ${nice} ${argv[0]}` : argv[0]];
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i];
+    const next = argv[i + 1];
+    const quote = (v: string) => (/[\s;()[\]]/.test(v) ? `'${v}'` : v);
+    if (a.startsWith("-") && next !== undefined && !next.startsWith("-")) {
+      lines.push(`  ${a} ${quote(next)}`);
+      i++;
+    } else {
+      lines.push(`  ${quote(a)}`);
+    }
+  }
+  return lines.join(" \\\n");
 }
 
 /** Long videos have hundreds of segments; past this many, each cell stands for a run of them. */
@@ -497,13 +580,16 @@ const LaneRow = memo(function LaneRow({
   segmentSeconds,
   duration,
   since,
+  now,
 }: {
   lane: Lane;
   fraction: number;
   segmentSeconds: number;
   duration: number;
   since: number | null;
+  now: number | null;
 }) {
+  const m = laneMetrics(lane, fraction, duration, segmentSeconds, now);
   const n = lane.segments.length;
   const cells = Math.min(n, MAX_CELLS);
   const per = n / Math.max(1, cells);
@@ -545,6 +631,8 @@ const LaneRow = memo(function LaneRow({
           <span>
             {lane.segmentsDone} / {n} segments{bytes > 0 ? ` · ${formatBytes(bytes)}` : ""}
           </span>
+          {m.speed !== null && <span>{m.speed.toFixed(2)}× realtime</span>}
+          {m.kbps !== null && <span>measured {Math.round(m.kbps)} kb/s incl. audio · target {lane.videoKbps} video</span>}
           {lane.publishedAt !== null && since !== null && lane.group >= 0 && <span>published at +{formatElapsed(lane.publishedAt - since)}</span>}
         </div>
       </div>
@@ -582,7 +670,19 @@ function PlaylistPanel({ lanes }: { lanes: Lane[] }) {
 /** The log shows the newest steps first. Progress ticks are left out; the lanes show them. */
 const LOG_LIMIT = 80;
 
-function EventLog({ events, count, state }: { events: PipelineEvent[]; count: number; state: PipelineState }) {
+function EventLog({
+  events,
+  count,
+  state,
+  selectedId,
+  onSelect,
+}: {
+  events: PipelineEvent[];
+  count: number;
+  state: PipelineState;
+  selectedId: number | null;
+  onSelect: (id: number) => void;
+}) {
   const rows: { e: PipelineEvent; text: string }[] = [];
   for (let i = count - 1; i >= 0 && rows.length < LOG_LIMIT; i--) {
     const e = events[i];
@@ -598,9 +698,15 @@ function EventLog({ events, count, state }: { events: PipelineEvent[]; count: nu
       </header>
       <ol className="pipeline-log">
         {rows.map(({ e, text }, i) => (
-          <li key={e.id} className={`pipeline-log__row${i === 0 ? " pipeline-log__row--latest" : ""}`}>
-            <span className="type-timecode pipeline-log__time">+{formatElapsed(new Date(e.at).getTime() - start)}</span>
-            <span className="type-small">{text}</span>
+          <li key={e.id}>
+            <button
+              className={`pipeline-log__row${i === 0 ? " pipeline-log__row--latest" : ""}${e.id === selectedId ? " pipeline-log__row--selected" : ""}`}
+              aria-pressed={e.id === selectedId}
+              onClick={() => onSelect(e.id)}
+            >
+              <span className="type-timecode pipeline-log__time">+{formatElapsed(new Date(e.at).getTime() - start)}</span>
+              <span className="type-small">{text}</span>
+            </button>
           </li>
         ))}
       </ol>
