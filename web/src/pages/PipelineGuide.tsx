@@ -34,7 +34,7 @@ export const EXPLAIN = {
   },
   encode: (seconds: number) => ({
     what: `One row per quality. Each box is a ${seconds}-second segment of video; it turns dark when ffmpeg finishes writing it. A quality is marked Playable the moment all its segments are done and it is added to the playlist.`,
-    why: `The smallest quality is encoded first, on its own and at full speed, so people can start watching within seconds. The bigger qualities share a single ffmpeg run that reads the source once, at a lower CPU priority so they never slow the first one down. Every quality is cut at exactly the same ${seconds}-second marks, which is what lets a player switch quality between any two segments without a glitch.`,
+    why: `Every quality is encoded by its own ffmpeg run, all at once. The smallest runs at full priority, so people can start watching within seconds, and each larger one runs at a lower CPU priority, so the qualities finish one after another, smallest first, and each can be watched as soon as it is done. Every quality is cut at exactly the same ${seconds}-second marks, which is what lets a player switch quality between any two segments without a glitch.`,
   }),
   timeline: {
     what: "The whole journey on one clock, in real time. Each bar is how long a stage took; small ticks are pieces arriving and segments being finished; the green dot is when a quality became watchable. The dashed line is the current moment.",

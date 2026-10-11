@@ -19,10 +19,12 @@ import {
 } from "./transcode.js";
 
 /**
- * Each encode group after the first runs this many nice levels lower, so smaller renditions get the CPU
- * first. At 10 the low-priority process gets roughly a tenth of a contested core.
+ * The CPU priority of each encode group, smallest rendition first: the smallest runs at full priority, and each
+ * larger one a step lower, so they finish in order and the cores are never idle. The big drop after the first
+ * keeps the smallest rendition almost as fast as if it ran alone (at nice 10 a process gets about a tenth of a
+ * contested core); the smaller steps after it still let 720p finish well before 1080p. 19 is the lowest there is.
  */
-const NICE_STEP = 10;
+const NICE_LEVELS = [0, 10, 15, 19];
 
 async function setProgress(videoId: string, progress: number, stage: string) {
   await query("UPDATE videos SET progress = $2, stage = $3 WHERE id = $1", [videoId, Math.round(progress), stage]);
@@ -70,7 +72,7 @@ export async function processVideo(videoId: string, job: { attempt?: number; max
   );
   const done = plan.filter((r) => published.has(r.name));
   const groups = encodeGroups(plan.filter((r) => !published.has(r.name)));
-  const niceFor = (i: number) => Math.min(19, i * NICE_STEP);
+  const niceFor = (i: number) => NICE_LEVELS[Math.min(i, NICE_LEVELS.length - 1)];
   await recordEvent(videoId, "planned", {
     renditions: plan.map((r) => {
       const group = groups.findIndex((g) => g.includes(r));
@@ -138,9 +140,9 @@ export async function processVideo(videoId: string, job: { attempt?: number; max
   };
   if (done.length > 0) await publish(done);
 
-  // Every group starts at once and they share the CPU, but each later (larger) group runs at a lower
-  // priority. The smallest rendition finishes about as fast as if it ran alone, the cores are never idle,
-  // and the larger renditions decode the source once between them. The benchmark is in the README.
+  // Every rendition starts at once and they share the CPU, but each larger one runs at a lower priority, so
+  // they finish smallest first and each is published as soon as it is done. The smallest finishes about as fast
+  // as if it ran alone and the cores are never idle. The benchmark is in the README.
   // If one group fails, stop the others rather than leave ffmpeg writing into the folder a retry will use.
   const abort = new AbortController();
   await Promise.all(

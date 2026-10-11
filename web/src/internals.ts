@@ -125,7 +125,7 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
         nodes: ["worker", "ffmpeg"],
         edges: ["worker-ffmpeg"],
         ops: (d.groups ?? []).map((g: any) => ({ layer: "Process" as Layer, text: `${g.nice ? `nice -n ${g.nice} ` : ""}${(g.command as string[]).join(" ")}` })),
-        why: `The worker now starts ffmpeg, the program that does the encoding. Each quality will be cut into ${d.segments} segments of ${d.segmentSeconds} seconds. The smallest quality gets its own ffmpeg run at full priority, so the video becomes watchable as early as possible. The larger qualities share a second run, which reads the original only once and resizes it for each, at a lower priority ("nice") so it never slows the first.`,
+        why: `The worker now starts ffmpeg, the program that does the encoding. Each quality will be cut into ${d.segments} segments of ${d.segmentSeconds} seconds. ${(d.groups ?? []).every((g: any) => g.renditions.length === 1) ? "Every quality gets its own ffmpeg run, all at once, smallest first in priority: the smallest at full priority, so the video becomes watchable as early as possible, and each larger one a step lower (\"nice\"), so the qualities finish one after another and each is published the moment it is done." : "The smallest quality gets its own ffmpeg run at full priority, so the video becomes watchable as early as possible. The larger qualities share a second run, which reads the original only once and resizes it for each, at a lower priority (\"nice\") so it never slows the first."}`,
       };
     case "encode_progress":
       return {

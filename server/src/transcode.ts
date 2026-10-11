@@ -40,12 +40,11 @@ export function planRenditions(srcWidth: number, srcHeight: number): PlannedRend
 }
 
 /**
- * Split a plan into encode groups, smallest first. The smallest rendition is encoded on its own so the
- * video becomes playable as early as possible; the rest share one ffmpeg run that decodes the source once.
+ * Split a plan into encode groups, smallest first: one rendition per group, so each quality is published the
+ * moment it is done instead of waiting for the largest. The cost is that every group decodes the source itself.
  */
 export function encodeGroups(plan: PlannedRendition[]): PlannedRendition[][] {
-  const ascending = [...plan].sort((a, b) => a.width * a.height - b.width * b.height);
-  return [ascending.slice(0, 1), ascending.slice(1)].filter((g) => g.length > 0);
+  return [...plan].sort((a, b) => a.width * a.height - b.width * b.height).map((r) => [r]);
 }
 
 export function bandwidthFor(r: { videoKbps: number }, hasAudio: boolean) {
