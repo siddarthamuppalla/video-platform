@@ -5,6 +5,7 @@ import { paths } from "./config.js";
 import { query } from "./db.js";
 import { HttpError } from "./errors.js";
 import { requireUser } from "./auth.js";
+import { eventsAfter, subscribe, type PipelineEvent } from "./events.js";
 
 export type Rendition = { name: string; width: number; height: number; bandwidth: number };
 
@@ -84,10 +85,84 @@ videosRouter.get("/mine", requireUser, async (req, res) => {
   res.json({ videos: rows.map(present) });
 });
 
+/** Anyone can see a playable video; its owner can also see it while it uploads and encodes. */
+async function visibleVideo(id: string, userId: string | undefined) {
+  const v = await findVideo(id);
+  if (!v || (!isPlayable(v) && v.user_id !== userId)) throw new HttpError(404, "Video not found.");
+  return v;
+}
+
 videosRouter.get("/:id", async (req, res) => {
-  const v = await findVideo(String(req.params.id));
-  if (!v || (!isPlayable(v) && v.user_id !== req.user?.id)) throw new HttpError(404, "Video not found.");
+  const v = await visibleVideo(String(req.params.id), req.user?.id);
   res.json({ video: present(v) });
+});
+
+const presentEvent = (e: PipelineEvent) => ({ id: e.id, at: e.at, kind: e.kind, data: e.data });
+
+// Every recorded pipeline step for one video, in order. The dashboard replays these.
+videosRouter.get("/:id/pipeline", async (req, res) => {
+  const v = await visibleVideo(String(req.params.id), req.user?.id);
+  const events: PipelineEvent[] = [];
+  // Read in pages so a long video's thousands of segment events don't come back as one huge query.
+  for (let page = await eventsAfter(v.id); page.length > 0; page = await eventsAfter(v.id, page[page.length - 1].id)) {
+    events.push(...page);
+  }
+  res.json({ video: present(v), events: events.map(presentEvent) });
+});
+
+// The same events as a live Server-Sent Events stream: everything after `?after=<id>` (or the browser's
+// Last-Event-ID when it reconnects), then each new event as it is recorded.
+videosRouter.get("/:id/pipeline/live", async (req, res) => {
+  const v = await visibleVideo(String(req.params.id), req.user?.id);
+  let last = Number(req.get("Last-Event-ID") ?? req.query.after ?? 0);
+  if (!Number.isSafeInteger(last) || last < 0) last = 0;
+
+  let closed = false;
+  let reading = false;
+  let again = false;
+  // Notifications can arrive faster than reads finish; one read at a time, and one more if any arrived meanwhile.
+  const pump = async () => {
+    if (reading) {
+      again = true;
+      return;
+    }
+    reading = true;
+    try {
+      do {
+        again = false;
+        for (const e of await eventsAfter(v.id, last)) {
+          if (closed) return;
+          res.write(`id: ${e.id}\ndata: ${JSON.stringify(presentEvent(e))}\n\n`);
+          last = e.id;
+        }
+      } while (again && !closed);
+    } catch (err) {
+      console.error(err);
+      res.end();
+    } finally {
+      reading = false;
+    }
+  };
+
+  let unsubscribe = () => {};
+  const heartbeat = setInterval(() => res.write(": keep-alive\n\n"), 15000);
+  res.on("close", () => {
+    closed = true;
+    clearInterval(heartbeat);
+    unsubscribe();
+  });
+  // Subscribe before the first read, so an event recorded in between isn't missed.
+  unsubscribe = await subscribe(v.id, () => void pump(), () => res.end());
+  if (closed) unsubscribe();
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    // Tells nginx not to buffer the stream.
+    "X-Accel-Buffering": "no",
+  });
+  res.write("retry: 2000\n\n");
+  await pump();
 });
 
 videosRouter.post("/:id/view", async (req, res) => {

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { api, type Video } from "../api";
 import { Player } from "../components/Player";
 import { StatusBadge } from "../components/StatusBadge";
@@ -66,6 +66,11 @@ export function Watch() {
             {formatDuration(video.durationSeconds)} · source {video.width}×{video.height} · {video.renditions.map((r) => r.name).join(" / ")}
           </p>
         )}
+        <p className="type-small">
+          <Link className="watch__pipeline" to={`/watch/${video.id}/pipeline`}>
+            {video.status === "ready" || video.status === "failed" ? "Replay how this video was uploaded and encoded" : "Watch it upload and encode live"}
+          </Link>
+        </p>
         {video.description && <p className="watch__description">{video.description}</p>}
       </section>
     </main>

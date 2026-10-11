@@ -4,6 +4,7 @@ import { useAuth } from "./auth";
 import { Header } from "./components/Header";
 import { Home } from "./pages/Home";
 import { Watch } from "./pages/Watch";
+import { Pipeline } from "./pages/Pipeline";
 import { Upload } from "./pages/Upload";
 import { MyVideos } from "./pages/MyVideos";
 import { AuthForm } from "./pages/AuthForm";
@@ -23,6 +24,7 @@ export function App() {
       <Routes>
         <Route path="/" element={<Home />} />
         <Route path="/watch/:id" element={<Watch />} />
+        <Route path="/watch/:id/pipeline" element={<Pipeline />} />
         <Route path="/upload" element={<RequireUser><Upload /></RequireUser>} />
         <Route path="/my-videos" element={<RequireUser><MyVideos /></RequireUser>} />
         <Route path="/signin" element={<AuthForm mode="signin" />} />

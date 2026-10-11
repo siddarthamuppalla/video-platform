@@ -19,6 +19,8 @@ export function Upload() {
   const [over, setOver] = useState(false);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
+  // Known as soon as the server creates the upload, so the live pipeline view can open while chunks are still going up.
+  const [videoId, setVideoId] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -47,6 +49,7 @@ export function Upload() {
         {
           title,
           description,
+          onSession: (session) => setVideoId(session.videoId),
           onProgress: (p) => {
             last = p;
             setPhase({ kind: "uploading", file, progress: p });
@@ -157,15 +160,23 @@ export function Upload() {
           </div>
           <div className="rl-upload__row">
             <span className="type-small upload__message">{phase.kind === "paused" ? phase.message : "Uploading in chunks. You can pause and resume at any time."}</span>
-            {phase.kind === "uploading" ? (
-              <button className="rl-btn rl-btn--secondary rl-btn--sm" onClick={() => abortRef.current?.abort()}>
-                Pause
-              </button>
-            ) : (
-              <button className="rl-btn rl-btn--primary rl-btn--sm" onClick={() => start(phase.file)}>
-                Resume
-              </button>
-            )}
+            <span className="upload__buttons">
+              {videoId && (
+                // A new tab, because leaving this page stops the upload.
+                <a className="rl-btn rl-btn--ghost rl-btn--sm" href={`/watch/${videoId}/pipeline`} target="_blank" rel="noopener">
+                  Watch live
+                </a>
+              )}
+              {phase.kind === "uploading" ? (
+                <button className="rl-btn rl-btn--secondary rl-btn--sm" onClick={() => abortRef.current?.abort()}>
+                  Pause
+                </button>
+              ) : (
+                <button className="rl-btn rl-btn--primary rl-btn--sm" onClick={() => start(phase.file)}>
+                  Resume
+                </button>
+              )}
+            </span>
           </div>
         </div>
       )}
@@ -189,15 +200,20 @@ export function Upload() {
                     ? `Your video is live at up to ${phase.video.renditions[0]?.name ?? "its first quality"}. Higher qualities are added as they finish.`
                     : "Upload complete. The encoder makes the smallest version first, so your video can be watched within moments."}
             </span>
-            {phase.video?.playable ? (
-              <Link className="rl-btn rl-btn--primary rl-btn--sm" to={`/watch/${phase.videoId}`}>
-                Watch
+            <span className="upload__buttons">
+              <Link className="rl-btn rl-btn--ghost rl-btn--sm" to={`/watch/${phase.videoId}/pipeline`}>
+                {phase.video?.status === "ready" ? "Replay" : "Watch live"}
               </Link>
-            ) : (
-              <Link className="rl-btn rl-btn--secondary rl-btn--sm" to="/my-videos">
-                Your videos
-              </Link>
-            )}
+              {phase.video?.playable ? (
+                <Link className="rl-btn rl-btn--primary rl-btn--sm" to={`/watch/${phase.videoId}`}>
+                  Watch
+                </Link>
+              ) : (
+                <Link className="rl-btn rl-btn--secondary rl-btn--sm" to="/my-videos">
+                  Your videos
+                </Link>
+              )}
+            </span>
           </div>
         </div>
       )}

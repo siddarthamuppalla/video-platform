@@ -133,6 +133,14 @@ The API serves the HLS files as static files under `/media`. Playlists are sent 
 
 A video can be watched while it is still encoding. Players read the master playlist once, so while the video is still `processing` the watch page polls it, and when a new rendition is published the player reloads the master playlist and carries on from the same position, playing or paused as before, with the same quality picked. The new quality then shows up in the menu and Auto can switch up to it.
 
+### 4. The pipeline dashboard
+
+`server/src/events.ts`, `web/src/pages/Pipeline.tsx`
+
+Every step a video takes is stored as a row in `pipeline_events` with a timestamp: the upload starting, each chunk arriving, assembly, the queue, probing, the encode plan, progress about once a second, each HLS segment as ffmpeg finishes writing it (read from ffmpeg's log, with its size), each rendition being published, and ready or failed. The API records the upload steps and the worker records the encode steps.
+
+Open it from a video's page, from "Your videos", or with "Watch live" while uploading. While a video is still moving, the dashboard streams new events over Server-Sent Events: an insert trigger sends a Postgres `NOTIFY`, and the API, which holds one `LISTEN` connection, wakes the streams watching that video. A reconnecting browser resumes from the last event id it saw. Once a video is finished, the same rows replay as an animation, with a scrubber, speeds from 0.5× to 8×, and long waits shortened so the replay keeps moving. Both views run the same function over the events (`web/src/pipeline.ts`), so the replay shows exactly what the live view showed. Videos uploaded before this was added have nothing to replay.
+
 ### Accounts
 
 `server/src/auth.ts`
@@ -147,11 +155,13 @@ server/              Express API and encoding worker (one image, two commands)
   src/uploads.ts     chunked upload endpoints
   src/transcode.ts   ffprobe, the bitrate ladder, ffmpeg HLS encoding, playlists
   src/pipeline.ts    one video's encode, start to finish, publishing each rendition as it lands
+  src/events.ts      pipeline events: recording, and the LISTEN connection behind the live stream
   bench/             encode-strategies.mjs, the benchmark behind the encoding strategy
   src/worker.ts      queue consumer
   test/              end to end test against real Postgres, Redis and ffmpeg
 web/                 React + Vite frontend
   src/uploader.ts    the chunking and resume logic
+  src/pipeline.ts    folds pipeline events into what the dashboard draws, live or replayed
   src/styles/        tokens and component styles copied from the design system
 ```
 
@@ -160,7 +170,7 @@ web/                 React + Vite frontend
 ```sh
 cd server && npm test                 # unit tests: ladder, playlists, chunk sizes
 cd server && npm run test:integration # needs Postgres, Redis and ffmpeg: sign up, upload out of order, resume, encode, fetch HLS
-cd web && npm test                    # uploader retry and resume, formatting
+cd web && npm test                    # uploader retry and resume, formatting, the dashboard's event model
 ```
 
 CI runs all three on every pull request.
