@@ -15,17 +15,14 @@ export type Lane = {
   videoKbps: number;
   bandwidth: number;
   codecs: string;
-  /** The encode tier: 0 is the smallest quality, whose chunks go first; 1 is the rest; -1 was kept from an earlier attempt. */
+  /** 0 is encoded first and alone; 1 is the shared run of the larger ones; -1 was kept from an earlier attempt. */
   group: number;
-  /** Recordings from before chunked encoding ran the larger qualities under `nice`; chunked plans have none. */
   nice: number | null;
   fraction: number;
   /** Bytes of each finished segment, or null while it is still being written. */
   segments: (number | null)[];
   /** When each segment finished (ms since epoch). */
   segmentAt: (number | null)[];
-  /** Which chunks a worker is encoding right now. Chunks run in parallel, so several can be true at once. */
-  encoding: boolean[];
   /** When this rendition's encode began: the plan that scheduled it. */
   startedAt: number | null;
   segmentsDone: number;
@@ -66,16 +63,8 @@ export type PipelineState = {
   assembly: null | { startedAt: number; doneAt: number | null; size: number };
   queuedAt: number | null;
   job: null | { queue: string; jobId: string; maxAttempts: number; backoffMs: number; attempt: number; pid: number | null; source: string | null };
-  /** The ffmpeg command each tier runs for every chunk (shown for chunk 0), with its exact arguments. */
-  groups: { renditions: string[]; nice: number; command: string[]; tier?: number; priority?: number }[];
-  /** The one ffmpeg run that encodes the whole soundtrack, when the video has sound. */
-  audio: null | { command: string[]; pending: boolean };
-  /** Whether the latest plan split the encode into chunk tasks (recordings from before that ran one ffmpeg per group). */
-  chunked: boolean;
-  /** The latest plan's encode tasks: one per tier per chunk, plus the audio. */
-  tasks: { total: number; running: number; done: number; failed: number; workers: string[] };
-  /** Tasks a worker is on right now, as "kind tier chunk". */
-  runningTasks: Set<string>;
+  /** The ffmpeg runs of the latest plan, with their exact arguments. */
+  groups: { renditions: string[]; nice: number; command: string[] }[];
   attempts: number;
   encodeStartedAt: number | null;
   plannedAt: number | null;
@@ -100,10 +89,6 @@ const empty = (): PipelineState => ({
   queuedAt: null,
   job: null,
   groups: [],
-  audio: null,
-  chunked: false,
-  tasks: { total: 0, running: 0, done: 0, failed: 0, workers: [] },
-  runningTasks: new Set(),
   attempts: 0,
   encodeStartedAt: null,
   plannedAt: null,
@@ -197,10 +182,6 @@ function apply(s: PipelineState, e: PipelineEvent, i: number) {
       s.segmentSeconds = d.segmentSeconds;
       s.segmentCount = d.segments;
       s.groups = d.groups ?? [];
-      s.audio = d.audio ?? null;
-      s.chunked = typeof d.tasks === "number";
-      s.tasks = { total: d.tasks ?? 0, running: 0, done: 0, failed: 0, workers: [] };
-      s.runningTasks = new Set();
       const previous = new Map(s.lanes.map((l) => [l.name, l]));
       s.lanes = (d.renditions as any[])
         .map((r): Lane => {
@@ -214,7 +195,7 @@ function apply(s: PipelineState, e: PipelineEvent, i: number) {
             bandwidth: r.bandwidth ?? 0,
             codecs: r.codecs ?? "",
             group: r.group,
-            nice: r.nice ?? null,
+            nice: r.nice,
             fraction: kept ? 1 : 0,
             // A kept rendition's segments are all on disk already; keep their sizes if this replay saw them.
             segments: kept
@@ -223,7 +204,6 @@ function apply(s: PipelineState, e: PipelineEvent, i: number) {
             segmentAt: kept
               ? Array.from({ length: d.segments }, (_, k) => before?.segmentAt[k] ?? null)
               : Array.from({ length: d.segments }, () => null),
-            encoding: Array.from({ length: d.segments }, () => false),
             startedAt: kept ? (before?.startedAt ?? null) : at,
             segmentsDone: kept ? d.segments : 0,
             publishedAt: kept ? (before?.publishedAt ?? null) : null,
@@ -246,25 +226,8 @@ function apply(s: PipelineState, e: PipelineEvent, i: number) {
       if (lane.segments[d.index] === null) lane.segmentsDone++;
       lane.segments[d.index] = d.bytes ?? 0;
       lane.segmentAt[d.index] = at;
-      lane.encoding[d.index] = false;
       break;
     }
-    case "task_started":
-      // Keyed by task, so a task the queue re-delivers while it still runs is counted once.
-      s.runningTasks.add(taskKey(d));
-      s.tasks.running = s.runningTasks.size;
-      if (d.worker && !s.tasks.workers.includes(d.worker)) s.tasks.workers.push(d.worker);
-      setEncoding(s, d, true);
-      break;
-    case "task_done":
-    case "task_failed":
-      // A failed attempt that will be retried goes back in the queue: neither done nor failed for good.
-      s.runningTasks.delete(taskKey(d));
-      s.tasks.running = s.runningTasks.size;
-      if (e.kind === "task_done") s.tasks.done++;
-      else if (d.final) s.tasks.failed++;
-      setEncoding(s, d, false);
-      break;
     case "published":
       for (const name of d.added as string[]) {
         const lane = s.lanes.find((l) => l.name === name);
@@ -305,18 +268,13 @@ export function laneMetrics(lane: Lane, fraction: number, durationSeconds: numbe
   return { speed, kbps, bytes };
 }
 
-/** How many lines open the master playlist before the first quality: the header, and the audio track if any. */
-export const masterPlaylistHeader = (hasAudio: boolean) => (hasAudio ? 4 : 3);
-
 /** The renditions in the master playlist so far, listed the way the server writes it (largest first). */
-export function masterPlaylistLines(lanes: Lane[], hasAudio = false) {
+export function masterPlaylistLines(lanes: Lane[]) {
   const published = lanes.filter((l) => l.publishedAt !== null).sort((a, b) => b.width * b.height - a.width * a.height);
-  const lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-INDEPENDENT-SEGMENTS"];
-  // The soundtrack is encoded once and shared by every quality, as its own playlist.
-  if (hasAudio) lines.push('#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio/index.m3u8"');
+  const lines = ["#EXTM3U", "#EXT-X-VERSION:3"];
   for (const l of published) {
     lines.push(
-      `#EXT-X-STREAM-INF:BANDWIDTH=${l.bandwidth},RESOLUTION=${l.width}x${l.height},CODECS="${l.codecs}",NAME="${l.name}"${hasAudio ? ',AUDIO="audio"' : ""}`,
+      `#EXT-X-STREAM-INF:BANDWIDTH=${l.bandwidth},RESOLUTION=${l.width}x${l.height},CODECS="${l.codecs}",NAME="${l.name}"`,
       `${l.name}/index.m3u8`,
     );
   }
@@ -340,16 +298,6 @@ export function replayTimes(events: PipelineEvent[], maxGap = Infinity) {
   return times;
 }
 
-const taskKey = (d: any) => `${d.kind} ${d.tier} ${d.chunk}`;
-
-/** Mark one chunk of every rendition in the task's tier as being encoded, or not. */
-function setEncoding(s: PipelineState, d: any, on: boolean) {
-  if (d.kind !== "video") return;
-  for (const lane of s.lanes) {
-    if (lane.group === d.tier && d.chunk >= 0 && d.chunk < lane.encoding.length) lane.encoding[d.chunk] = on;
-  }
-}
-
 /** How many events have happened by replay time `t`: the first index whose time is after `t`. */
 export function eventsBy(times: number[], t: number) {
   let lo = 0;
@@ -363,8 +311,8 @@ export function eventsBy(times: number[], t: number) {
 }
 
 /**
- * Encode progress is reported after each finished chunk (about once a second in older recordings). During a
- * replay, ease each lane between the report before `t` and the next one, so bars move smoothly instead of jumping.
+ * Encode progress is reported about once a second. During a replay, ease each lane between the report
+ * before `t` and the next one, so bars move smoothly instead of jumping.
  */
 export function interpolatedFractions(state: PipelineState, events: PipelineEvent[], times: number[], count: number, t: number) {
   const out = new Map(state.lanes.map((l) => [l.name, l.fraction]));
@@ -405,19 +353,11 @@ export function describeEvent(e: PipelineEvent, totalChunks?: number): string | 
     case "planned": {
       const fresh = (d.renditions as any[]).filter((r) => r.group >= 0).map((r) => r.name);
       const kept = (d.renditions as any[]).filter((r) => r.group < 0).map((r) => r.name);
-      const parts = [fresh.length ? `Encoding ${fresh.join(", ")}` : "", kept.length ? `keeping ${kept.join(", ")}` : ""].filter(Boolean).join("; ");
-      return typeof d.tasks === "number"
-        ? `${parts}: ${d.segments} chunk${d.segments === 1 ? "" : "s"} of ${d.segmentSeconds} s, ${d.tasks} encode task${d.tasks === 1 ? "" : "s"} queued`
-        : `${parts} in ${d.segments} segment${d.segments === 1 ? "" : "s"} each`;
+      return [fresh.length ? `Encoding ${fresh.join(", ")}` : "", kept.length ? `keeping ${kept.join(", ")}` : ""].filter(Boolean).join("; ") +
+        ` in ${d.segments} segment${d.segments === 1 ? "" : "s"} each`;
     }
     case "segment":
       return `${d.rendition} segment ${d.index} written${d.bytes ? `, ${formatBytes(d.bytes)}` : ""}`;
-    case "task_started":
-      return `${taskName(d)} started${d.attempt > 1 ? ` (attempt ${d.attempt})` : ""} on ${d.worker}`;
-    case "task_done":
-      return `${taskName(d)} done in ${formatElapsed(d.ms ?? 0)}${d.bytes ? `, ${formatBytes(d.bytes)}` : ""}`;
-    case "task_failed":
-      return `${taskName(d)} failed: ${d.error}${d.final ? "" : " Retrying."}`;
     case "published":
       return `${(d.added as string[]).join(", ")} published. ${d.renditions.length === d.added.length ? "The video can play now." : `Qualities: ${d.renditions.join(", ")}.`}`;
     case "ready":
@@ -427,11 +367,6 @@ export function describeEvent(e: PipelineEvent, totalChunks?: number): string | 
     default:
       return null;
   }
-}
-
-/** "Chunk 3 of 360p" or "Audio": what one encode task is. */
-function taskName(d: any) {
-  return d.kind === "audio" ? "Audio" : `Chunk ${d.chunk} of ${(d.renditions ?? []).join(", ")}`;
 }
 
 /** Elapsed time for timecodes: 0.84 s, 12.3 s, 4:05. */

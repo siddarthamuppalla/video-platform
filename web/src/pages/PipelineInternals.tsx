@@ -38,13 +38,7 @@ function nodeMetric(id: NodeId, s: PipelineState, count: number) {
   const u = s.upload;
   const requests = u ? u.requests + 1 + (s.assembly ? 1 : 0) : 0;
   const segmentBytes = s.lanes.reduce((sum, l) => sum + l.segments.reduce<number>((a, b) => a + (b ?? 0), 0), 0);
-  // Chunked encodes report each task; older recordings ran one ffmpeg per group until its qualities were published.
-  const running =
-    s.stage !== "encode"
-      ? 0
-      : s.chunked
-        ? s.tasks.running
-        : s.groups.filter((g) => g.renditions.some((r) => s.lanes.find((l) => l.name === r)?.publishedAt === null)).length;
+  const running = s.stage === "encode" ? s.groups.filter((g) => g.renditions.some((r) => s.lanes.find((l) => l.name === r)?.publishedAt === null)).length : 0;
   switch (id) {
     case "browser":
     case "nginx":
@@ -55,7 +49,6 @@ function nodeMetric(id: NodeId, s: PipelineState, count: number) {
     case "disk":
       return `${formatBytes((u?.bytes ?? 0) + (s.assembly?.doneAt ? s.assembly.size : 0) + segmentBytes)} written`;
     case "redis":
-      if (s.stage === "encode" && s.chunked) return `${Math.max(0, s.tasks.total - s.tasks.done - s.tasks.failed - s.tasks.running)} tasks waiting`;
       return !s.job ? "no job" : s.stage === "ready" ? "job completed" : s.stage === "failed" ? "job failed" : s.encodeStartedAt ? "job active" : "job waiting";
     case "worker":
       return s.stage === "probe" || s.stage === "encode" ? `attempt ${s.job?.attempt ?? s.attempts}` : s.stage === "ready" || s.stage === "failed" ? "done" : "idle";

@@ -11,7 +11,6 @@ import {
   formatElapsed,
   interpolatedFractions,
   laneMetrics,
-  masterPlaylistHeader,
   masterPlaylistLines,
   pipelineState,
   replayTimes,
@@ -216,7 +215,7 @@ export function Pipeline() {
               <Waterfall state={state} endAt={endAt} />
             </div>
             <aside className="pipeline__side">
-              <PlaylistPanel lanes={state.lanes} hasAudio={state.probe?.hasAudio ?? false} />
+              <PlaylistPanel lanes={state.lanes} />
               <EventLog events={events} count={count} state={state} selectedId={focus?.id ?? null} onSelect={setSelectedId} />
               <Glossary />
             </aside>
@@ -392,13 +391,6 @@ function Stats({ state }: { state: PipelineState }) {
       value: segmentsTotal ? `${segmentsDone} / ${segmentsTotal}` : "Not yet",
       detail: state.segmentCount ? `${state.segmentCount} per quality, ${state.segmentSeconds} s each` : "",
     },
-    {
-      label: "Encode tasks",
-      value: state.tasks.total ? `${state.tasks.done} / ${state.tasks.total}` : "Not yet",
-      detail: state.tasks.total
-        ? `${state.tasks.running} running${state.tasks.failed ? ` · ${state.tasks.failed} failed` : ""} · ${state.tasks.workers.length} worker${state.tasks.workers.length === 1 ? "" : "s"}`
-        : "",
-    },
   ];
   return (
     <dl className="pipeline-stats">
@@ -534,7 +526,6 @@ function EncodePanel({ state, fractions }: { state: PipelineState; fractions: Ma
               lane={lane}
               fraction={fractions.get(lane.name) ?? lane.fraction}
               segmentSeconds={state.segmentSeconds}
-              chunked={state.chunked}
               duration={state.probe?.durationSeconds ?? 0}
               since={state.plannedAt}
               now={state.now}
@@ -542,21 +533,13 @@ function EncodePanel({ state, fractions }: { state: PipelineState; fractions: Ma
           ))}
         </ul>
       )}
-      {(state.groups.length > 0 || state.audio) && (
+      {state.groups.length > 0 && (
         <div className="pipeline-commands">
-          <h3 className="type-label pipeline-commands__title">ffmpeg commands</h3>
-          {state.audio?.pending && (
-            <details className="hood__details">
-              <summary className="type-small">Audio: the whole soundtrack, once · queue priority 1</summary>
-              <pre className="hood__json type-timecode">{formatCommand(state.audio.command, 0)}</pre>
-            </details>
-          )}
+          <h3 className="type-label pipeline-commands__title">ffmpeg runs</h3>
           {state.groups.map((g, i) => (
             <details key={i} className="hood__details">
               <summary className="type-small">
-                {g.tier !== undefined
-                  ? `Tier ${g.tier}: ${g.renditions.join(", ")} · one task per chunk, shown for chunk 0 · queue priority ${g.priority}`
-                  : `Run ${i + 1}: ${g.renditions.join(", ")} · ${g.nice ? `nice ${g.nice}` : "full priority"}`}
+                Run {i + 1}: {g.renditions.join(", ")} · {g.nice ? `nice ${g.nice}` : "full priority"}
               </summary>
               <pre className="hood__json type-timecode">{formatCommand(g.command, g.nice)}</pre>
             </details>
@@ -591,7 +574,6 @@ const LaneRow = memo(function LaneRow({
   lane,
   fraction,
   segmentSeconds,
-  chunked,
   duration,
   since,
   now,
@@ -599,7 +581,6 @@ const LaneRow = memo(function LaneRow({
   lane: Lane;
   fraction: number;
   segmentSeconds: number;
-  chunked: boolean;
   duration: number;
   since: number | null;
   now: number | null;
@@ -608,36 +589,22 @@ const LaneRow = memo(function LaneRow({
   const n = lane.segments.length;
   const cells = Math.min(n, MAX_CELLS);
   const per = n / Math.max(1, cells);
-  // Chunked encodes say which chunks are being encoded right now; those cells show as in progress. Older
-  // recordings had one ffmpeg run per quality, so its position in the source fills the segment it is writing.
-  const head = chunked ? 0 : lane.publishedAt !== null ? n : Math.min(n, (fraction * duration) / segmentSeconds);
+  // Where ffmpeg is in the source, in segments. The segment it is writing fills as it goes.
+  const head = lane.publishedAt !== null ? n : Math.min(n, (fraction * duration) / segmentSeconds);
   const fills = Array.from({ length: cells }, (_, j) => {
     const from = j * per;
     const to = (j + 1) * per;
     let done = 0;
-    let running = 0;
-    for (let k = Math.floor(from); k < Math.ceil(to); k++) {
-      if (lane.segments[k] !== null) done++;
-      else if (lane.encoding[k]) running++;
-    }
-    const total = Math.max(1, Math.ceil(to) - Math.floor(from));
-    const written = done / total;
-    const writing = chunked ? (done + running) / total : Math.min(1, Math.max(0, (head - from) / (to - from)));
+    for (let k = Math.floor(from); k < Math.ceil(to); k++) if (lane.segments[k] !== null) done++;
+    const written = done / Math.max(1, Math.ceil(to) - Math.floor(from));
+    const writing = Math.min(1, Math.max(0, (head - from) / (to - from)));
     return { written, writing: Math.max(written, writing) };
   });
   const bytes = lane.segments.reduce<number>((sum, b) => sum + (b ?? 0), 0);
   const status =
     lane.publishedAt !== null ? (lane.group < 0 ? "Kept" : "Playable") : fraction > 0 ? `${Math.floor(fraction * 100)}%` : "Waiting";
   const role =
-    lane.group < 0
-      ? "kept from an earlier attempt"
-      : chunked
-        ? lane.group === 0
-          ? "tier 0, its chunks go first"
-          : `tier ${lane.group}, chunks after tier 0`
-        : lane.group === 0
-          ? "encoded first, full priority"
-          : `shared run, nice ${lane.nice ?? 0}`;
+    lane.group < 0 ? "kept from an earlier attempt" : lane.group === 0 ? "encoded first, full priority" : `shared run, nice ${lane.nice ?? 0}`;
 
   return (
     <li className={`pipeline-lane${lane.publishedAt !== null ? " pipeline-lane--published" : ""}`}>
@@ -675,9 +642,8 @@ const LaneRow = memo(function LaneRow({
   );
 });
 
-function PlaylistPanel({ lanes, hasAudio }: { lanes: Lane[]; hasAudio: boolean }) {
-  const lines = masterPlaylistLines(lanes, hasAudio);
-  const header = masterPlaylistHeader(hasAudio);
+function PlaylistPanel({ lanes }: { lanes: Lane[] }) {
+  const lines = masterPlaylistLines(lanes);
   return (
     <section className="panel pipeline-panel">
       <header className="pipeline-panel__head">
@@ -685,8 +651,8 @@ function PlaylistPanel({ lanes, hasAudio }: { lanes: Lane[]; hasAudio: boolean }
       </header>
       <Explainer {...EXPLAIN.playlist} />
       <pre className="pipeline-playlist type-timecode">
-        {lines.length > header ? (
-          lines.map((line, i) => <span key={line} className={`pipeline-playlist__line${i >= header ? " pipeline-playlist__line--added" : ""}`}>{line}{"\n"}</span>)
+        {lines.length > 2 ? (
+          lines.map((line, i) => <span key={line} className={`pipeline-playlist__line${i >= 2 ? " pipeline-playlist__line--added" : ""}`}>{line}{"\n"}</span>)
         ) : (
           <span className="pipeline-playlist__empty">Not written yet. It appears when the first quality is ready.</span>
         )}

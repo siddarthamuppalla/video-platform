@@ -1,28 +1,14 @@
-import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-export type Probe = {
-  durationSeconds: number;
-  startSeconds: number;
-  width: number;
-  height: number;
-  hasAudio: boolean;
-  /** Whether ffmpeg can seek in this container to the keyframe before a time. See chunkArgs. */
-  seekable?: boolean;
-};
-
-// Containers with an index, where ffmpeg's input -ss lands on the keyframe at or before the time asked for. In
-// MPEG-TS and other streams without one, it can land on the keyframe after it, which would drop a chunk's first frames.
-const SEEKABLE = /\b(mov|mp4|matroska|webm)\b/;
+export type Probe = { durationSeconds: number; width: number; height: number; hasAudio: boolean };
 export type Rung = { name: string; height: number; videoKbps: number; profile: "main" | "high"; level: string; codec: string };
 export type PlannedRendition = Rung & { width: number };
 
 /**
- * The ladder, highest first. Each source is encoded once per rung at or below its own size.
- * videoKbps is the rung's bitrate cap (see CRF). Profile and level are pinned per rung so the CODECS string
- * in the master playlist matches the stream.
+ * The bitrate ladder, highest first. Each source is encoded once per rung at or below its own size.
+ * Profile and level are pinned per rung so the CODECS string in the master playlist matches the stream.
  */
 export const LADDER: Rung[] = [
   { name: "2160p", height: 2160, videoKbps: 16000, profile: "high", level: "5.2", codec: "avc1.640034" },
@@ -32,16 +18,8 @@ export const LADDER: Rung[] = [
   { name: "360p", height: 360, videoKbps: 800, profile: "main", level: "4.0", codec: "avc1.4d4028" },
 ];
 export const AUDIO_KBPS = 128;
-/**
- * Segment length in seconds, which is also the chunk length: each chunk is encoded on its own and becomes exactly
- * one segment in every rendition, so all renditions cut at the same timestamps and players can switch at any boundary.
- */
+/** Segment length in seconds. Every rendition cuts at the same timestamps, so players can switch at any boundary. */
 export const SEGMENT_SECONDS = 6;
-/**
- * Quality target. Capped CRF gives every frame the bits its content needs, up to the rung's bitrate cap. Unlike a
- * target bitrate it has no warm-up, so each independently encoded chunk starts at full quality (see the README).
- */
-export const CRF = 21;
 
 const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
 
@@ -62,8 +40,8 @@ export function planRenditions(srcWidth: number, srcHeight: number): PlannedRend
 }
 
 /**
- * Split a plan into encode tiers, smallest first. Tier 0 is the smallest rendition on its own, so the video
- * becomes playable as early as possible; tier 1 is the rest, which decode each chunk once between them.
+ * Split a plan into encode groups, smallest first. The smallest rendition is encoded on its own so the
+ * video becomes playable as early as possible; the rest share one ffmpeg run that decodes the source once.
  */
 export function encodeGroups(plan: PlannedRendition[]): PlannedRendition[][] {
   const ascending = [...plan].sort((a, b) => a.width * a.height - b.width * b.height);
@@ -77,64 +55,33 @@ export function bandwidthFor(r: { videoKbps: number }, hasAudio: boolean) {
 
 /** The master playlist is the entry point a player loads: one line per rendition, which it picks between by bandwidth. */
 export function masterPlaylist(renditions: PlannedRendition[], hasAudio: boolean) {
-  const lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-INDEPENDENT-SEGMENTS"];
-  // Audio is encoded once for the whole video and shared by every rendition, as its own playlist.
-  if (hasAudio) lines.push(`#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio/index.m3u8"`);
+  const lines = ["#EXTM3U", "#EXT-X-VERSION:3"];
   for (const r of renditions) {
     const codecs = hasAudio ? `${r.codec},mp4a.40.2` : r.codec;
     lines.push(
-      `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidthFor(r, hasAudio)},RESOLUTION=${r.width}x${r.height},CODECS="${codecs}",NAME="${r.name}"${hasAudio ? ',AUDIO="audio"' : ""}`,
+      `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidthFor(r, hasAudio)},RESOLUTION=${r.width}x${r.height},CODECS="${codecs}",NAME="${r.name}"`,
       `${r.name}/index.m3u8`,
     );
   }
   return lines.join("\n") + "\n";
 }
 
-export const segmentName = (index: number) => `segment_${String(index).padStart(4, "0")}.ts`;
+type RunOptions = { nice?: number; signal?: AbortSignal; onStderr?: (chunk: string) => void };
 
-/** A rendition's playlist: one line per chunk's segment, with the length that chunk actually came out at. */
-export function mediaPlaylist(durations: number[]) {
-  const lines = [
-    "#EXTM3U",
-    "#EXT-X-VERSION:3",
-    `#EXT-X-TARGETDURATION:${Math.ceil(Math.max(...durations) - 0.001)}`,
-    "#EXT-X-MEDIA-SEQUENCE:0",
-    "#EXT-X-PLAYLIST-TYPE:VOD",
-    "#EXT-X-INDEPENDENT-SEGMENTS",
-  ];
-  durations.forEach((d, i) => lines.push(`#EXTINF:${d.toFixed(6)},`, segmentName(i)));
-  return [...lines, "#EXT-X-ENDLIST"].join("\n") + "\n";
-}
-
-/** A chunk covers source time [start, end). The last chunk runs to the end of the video, so its end is null. */
-export type Chunk = { index: number; start: number; end: number | null };
-
-/**
- * The chunk index: the video cut into SEGMENT_SECONDS pieces. A leftover shorter than a second is folded into the
- * chunk before it rather than becoming a tiny chunk of its own, which might hold no frames at all.
- */
-export function planChunks(durationSeconds: number, seconds = SEGMENT_SECONDS): Chunk[] {
-  let count = Math.max(1, Math.ceil(durationSeconds / seconds - 1e-9));
-  if (count > 1 && durationSeconds - (count - 1) * seconds < 1) count -= 1;
-  return Array.from({ length: count }, (_, index) => ({
-    index,
-    start: index * seconds,
-    end: index === count - 1 ? null : (index + 1) * seconds,
-  }));
-}
-
-type RunOptions = { signal?: AbortSignal };
-
-function run(cmd: string, args: string[], opts: RunOptions = {}) {
+function run(cmd: string, args: string[], onStdout?: (chunk: string) => void, opts: RunOptions = {}) {
   return new Promise<string>((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], signal: opts.signal });
+    // `nice` lowers the process's CPU priority, so a concurrent encode at normal priority gets the cores first.
+    const [bin, argv] = opts.nice ? ["nice", ["-n", String(opts.nice), cmd, ...args]] : [cmd, args];
+    const child = spawn(bin, argv, { stdio: ["ignore", "pipe", "pipe"], signal: opts.signal });
     let out = "";
     let err = "";
     child.stdout.setEncoding("utf8").on("data", (d: string) => {
       out += d;
+      onStdout?.(d);
     });
     child.stderr.setEncoding("utf8").on("data", (d: string) => {
       err = (err + d).slice(-4000);
+      opts.onStderr?.(d);
     });
     child.on("error", reject);
     child.on("close", (code) => {
@@ -158,117 +105,104 @@ export async function probe(file: string): Promise<Probe> {
   const sideways = rotation === 90 || rotation === 270;
   return {
     durationSeconds: duration,
-    // Most files start at 0, but some start later. ffmpeg shifts a whole-file encode to start at 0, so chunks do too.
-    startSeconds: Number(data.format?.start_time) || 0,
-    seekable: SEEKABLE.test(String(data.format?.format_name ?? "")),
     width: sideways ? video.height : video.width,
     height: sideways ? video.width : video.height,
     hasAudio: data.streams.some((s: any) => s.codec_type === "audio"),
   };
 }
 
-const sec = (n: number) => n.toFixed(6);
+/** The output options for one rendition: H.264 + AAC, cut into SEGMENT_SECONDS segments under `outDir/<name>/`. */
+function renditionOutput(outDir: string, r: PlannedRendition, src: Probe, video: string[]) {
+  const dir = path.join(outDir, r.name);
+  return [
+    ...video, ...(src.hasAudio ? ["-map", "0:a:0"] : []),
+    "-c:v", "libx264", "-preset", "veryfast", "-profile:v", r.profile, "-level:v", r.level, "-pix_fmt", "yuv420p",
+    "-b:v", `${r.videoKbps}k`, "-maxrate", `${Math.round(r.videoKbps * 1.07)}k`, "-bufsize", `${r.videoKbps * 2}k`,
+    // A keyframe exactly every SEGMENT_SECONDS lines segment boundaries up across renditions.
+    "-force_key_frames", `expr:gte(t,n_forced*${SEGMENT_SECONDS})`, "-sc_threshold", "0",
+    ...(src.hasAudio ? ["-c:a", "aac", "-b:a", `${AUDIO_KBPS}k`, "-ac", "2", "-ar", "48000"] : []),
+    "-f", "hls", "-hls_time", String(SEGMENT_SECONDS), "-hls_playlist_type", "vod",
+    "-hls_segment_filename", path.join(dir, "segment_%04d.ts"),
+    path.join(dir, "index.m3u8"),
+  ];
+}
 
 /**
- * The ffmpeg arguments that encode one chunk into one segment per rendition, video only.
- *
- * - Seek a second early, keeping the source's own timestamps (-copyts), then cut exactly with the trim filter.
- *   trim keeps the frames whose time is in [start, end), so neighbouring chunks never share or drop a frame,
- *   whatever the frame rate. -ss counts from the file's start, while trim sees the source's timestamps, which
- *   include the start time. Files without an index (MPEG-TS) are read from the beginning instead of seeking.
- * - Keep each frame's real time in the video (shifted only by the file's start time), so segment 7 says it starts
- *   at 42 s and the player sees one continuous timeline. -avoid_negative_ts disabled stops the muxer from shifting
- *   the first chunk differently from the rest.
- * - Decode once and split for each rendition, as YouTube's "multiple output transcoding" does.
+ * The ffmpeg arguments that encode several renditions in one process. The source is decoded once and the
+ * frames are split and scaled for each output, instead of every rendition decoding the whole source again.
  */
-export function chunkArgs(source: string, outDir: string, chunk: Chunk, rs: PlannedRendition[], src: Probe, threads = 0, tmp = ".tmp") {
-  const from = src.startSeconds + chunk.start;
-  const cut = `trim=start=${sec(from)}${chunk.end === null ? "" : `:end=${sec(src.startSeconds + chunk.end)}`}`;
+export function encodeArgs(source: string, outDir: string, rs: PlannedRendition[], src: Probe) {
+  const head = ["-y", "-hide_banner", "-nostats", "-progress", "pipe:1", "-i", source];
+  if (rs.length === 1) {
+    return [...head, ...renditionOutput(outDir, rs[0], src, ["-map", "0:v:0", "-vf", `scale=${rs[0].width}:${rs[0].height}`])];
+  }
   const graph = [
-    `[0:v]${cut},setpts=PTS-${sec(src.startSeconds)}/TB,split=${rs.length}${rs.map((_, i) => `[in${i}]`).join("")}`,
+    `[0:v]split=${rs.length}${rs.map((_, i) => `[in${i}]`).join("")}`,
     ...rs.map((r, i) => `[in${i}]scale=${r.width}:${r.height}[out${i}]`),
   ].join(";");
-  return [
-    "-y", "-hide_banner", "-loglevel", "error",
-    ...(src.seekable ? ["-ss", sec(Math.max(0, chunk.start - 1))] : []), "-copyts", "-i", source,
-    "-filter_complex", graph,
-    ...rs.flatMap((r, i) => [
-      "-map", `[out${i}]`,
-      "-c:v", "libx264", "-preset", "veryfast", "-threads", String(threads), "-profile:v", r.profile, "-level:v", r.level,
-      "-pix_fmt", "yuv420p", "-crf", String(CRF), "-maxrate", `${Math.round(r.videoKbps * 1.07)}k`, "-bufsize", `${r.videoKbps * 2}k`,
-      "-avoid_negative_ts", "disabled", "-f", "mpegts", path.join(outDir, r.name, `${segmentName(chunk.index)}${tmp}`),
-    ]),
-  ];
-}
-
-/** The ffmpeg arguments that encode the whole video's audio once, cut into segments of its own. */
-export function audioArgs(source: string, outDir: string, dirName = "audio") {
-  const dir = path.join(outDir, dirName);
-  return [
-    "-y", "-hide_banner", "-loglevel", "error", "-i", source, "-map", "0:a:0",
-    "-c:a", "aac", "-b:a", `${AUDIO_KBPS}k`, "-ac", "2", "-ar", "48000",
-    "-f", "hls", "-hls_time", String(SEGMENT_SECONDS), "-hls_playlist_type", "vod",
-    "-hls_segment_filename", path.join(dir, "segment_%04d.ts"), path.join(dir, "index.m3u8"),
-  ];
-}
-
-async function segmentSeconds(file: string) {
-  const out = await run("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration", "-of", "csv=p=0", file]);
-  const seconds = Number(out.trim().split("\n")[0]);
-  if (!Number.isFinite(seconds) || seconds <= 0) throw new Error(`Couldn't read the length of ${path.basename(file)}.`);
-  return seconds;
+  return [...head, "-filter_complex", graph, ...rs.flatMap((r, i) => renditionOutput(outDir, r, src, ["-map", `[out${i}]`]))];
 }
 
 /**
- * Encode one chunk into one segment per rendition. Segments are written under a temporary name and renamed only
- * once ffmpeg has finished, so a crash never leaves a half-written segment behind. The name is unique to this run,
- * so if the queue hands the same task to two workers at once (it re-delivers a job whose worker looked stalled),
- * neither overwrites the other's file mid-write; both produce the same segment and the last rename wins. Returns the chunk's real length
- * (the playlist needs it) and the bytes written, in total and per rendition.
+ * Turns ffmpeg's log into "segment finished" calls. The HLS muxer logs `Opening '.../720p/segment_0003.ts'
+ * for writing` as it starts each segment, which means the one before it is complete; the last segment of
+ * each rendition is complete when ffmpeg exits, which is what `finish` reports.
  */
-export async function encodeChunk(source: string, outDir: string, chunk: Chunk, rs: PlannedRendition[], src: Probe, opts: RunOptions & { threads?: number } = {}) {
-  await Promise.all(rs.map((r) => fsp.mkdir(path.join(outDir, r.name), { recursive: true })));
-  const tmp = `.${randomUUID().slice(0, 8)}.tmp`;
-  try {
-    await run("ffmpeg", chunkArgs(source, outDir, chunk, rs, src, opts.threads, tmp), opts);
-  } catch (err) {
-    await Promise.all(rs.map((r) => fsp.rm(path.join(outDir, r.name, `${segmentName(chunk.index)}${tmp}`), { force: true })));
-    throw err;
-  }
-  const segments: { rendition: string; bytes: number }[] = [];
-  for (const r of rs) {
-    const file = path.join(outDir, r.name, segmentName(chunk.index));
-    await fsp.rename(`${file}${tmp}`, file);
-    segments.push({ rendition: r.name, bytes: (await fsp.stat(file)).size });
-  }
+export function segmentTracker(onSegment: (rendition: string, index: number) => void) {
+  const opened = new Map<string, number>();
+  let buffer = "";
   return {
-    durationSeconds: await segmentSeconds(path.join(outDir, rs[0].name, segmentName(chunk.index))),
-    bytes: segments.reduce((sum, s) => sum + s.bytes, 0),
-    segments,
+    feed(chunk: string) {
+      buffer += chunk;
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const m = /Opening '[^']*?([^/\\']+)[/\\]segment_(\d+)\.ts' for writing/.exec(line);
+        if (!m) continue;
+        const [, rendition, n] = m;
+        const index = Number(n);
+        opened.set(rendition, index);
+        if (index > 0) onSegment(rendition, index - 1);
+      }
+    },
+    finish() {
+      for (const [rendition, index] of opened) onSegment(rendition, index);
+      opened.clear();
+    },
   };
 }
 
 /**
- * Encode the whole soundtrack into audio/, through a folder of its own that is swapped in at the end. `keep` is
- * asked just before the swap; if it says no (another run already finished this task), the new files are dropped
- * and the published ones are left alone.
+ * Encode one or more renditions to HLS in a single ffmpeg run. All outputs advance together, so they
+ * finish together. `nice` runs it at a lower CPU priority (see processVideo).
  */
-export async function encodeAudio(source: string, outDir: string, opts: RunOptions & { keep?: () => Promise<boolean> } = {}) {
-  const name = `audio.${randomUUID().slice(0, 8)}.tmp`;
-  const tmp = path.join(outDir, name);
-  await fsp.mkdir(tmp, { recursive: true });
-  try {
-    await run("ffmpeg", audioArgs(source, outDir, name), opts);
-    const files = await fsp.readdir(tmp);
-    const sizes = await Promise.all(files.map((f) => fsp.stat(path.join(tmp, f)).then((s) => s.size)));
-    if (opts.keep && !(await opts.keep())) return { bytes: 0, kept: false };
-    const dir = path.join(outDir, "audio");
-    await fsp.rm(dir, { recursive: true, force: true });
-    await fsp.rename(tmp, dir);
-    return { bytes: sizes.reduce((a, b) => a + b, 0), kept: true };
-  } finally {
-    await fsp.rm(tmp, { recursive: true, force: true });
-  }
+export async function encodeRenditions(
+  source: string,
+  outDir: string,
+  rs: PlannedRendition[],
+  src: Probe,
+  onProgress: (fraction: number) => void,
+  opts: RunOptions & { onSegment?: (rendition: string, index: number) => void } = {},
+) {
+  await Promise.all(rs.map((r) => fsp.mkdir(path.join(outDir, r.name), { recursive: true })));
+  const segments = segmentTracker((rendition, index) => opts.onSegment?.(rendition, index));
+  let buffer = "";
+  await run(
+    "ffmpeg",
+    encodeArgs(source, outDir, rs, src),
+    (chunk) => {
+      buffer += chunk;
+      const matches = [...buffer.matchAll(/out_time_us=(\d+)/g)];
+      if (matches.length) {
+        const us = Number(matches[matches.length - 1][1]);
+        onProgress(Math.min(1, us / 1e6 / src.durationSeconds));
+        buffer = buffer.slice(buffer.lastIndexOf("out_time_us="));
+      }
+    },
+    { ...opts, onStderr: (chunk) => segments.feed(chunk) },
+  );
+  segments.finish();
+  onProgress(1);
 }
 
 export async function makeThumbnail(source: string, outDir: string, src: Probe) {
