@@ -14,14 +14,12 @@ process.env.CHUNK_SIZE = String(256 * 1024);
 const { createApp } = await import("../src/app.js");
 const { migrate } = await import("../src/migrate.js");
 const { pool } = await import("../src/db.js");
-const { planVideo, runTask, taskFailed } = await import("../src/pipeline.js");
-const { closeQueues, encodeChunkQueue } = await import("../src/queue.js");
-const { startWorkers } = await import("../src/worker.js");
+const { processVideo } = await import("../src/pipeline.js");
+const { transcodeQueue } = await import("../src/queue.js");
 const { closeListener, recordEvent } = await import("../src/events.js");
 
 const sample = path.join(storage, "sample.mp4");
 const agent = request.agent(createApp());
-let workers: { close(): Promise<void> } | undefined;
 
 beforeAll(async () => {
   await migrate();
@@ -35,8 +33,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await workers?.close();
-  await closeQueues();
+  await transcodeQueue().close();
   await closeListener();
   await pool.end();
   fs.rmSync(storage, { recursive: true, force: true });
@@ -113,17 +110,7 @@ describe("upload to playback", () => {
         await new Promise((r) => setTimeout(r, 25));
       }
     })();
-    // The upload queued a planning job. Starting workers picks it up, fans the chunks out and encodes them.
-    workers = startWorkers({ concurrency: 2, log: false });
-    try {
-      for (let i = 0; i < 1200; i++) {
-        const { body } = await agent.get(`/api/videos/${videoId}`);
-        if (body.video.status === "ready" || body.video.status === "failed") break;
-        await new Promise((r) => setTimeout(r, 50));
-      }
-    } finally {
-      encoding = false;
-    }
+    await processVideo(videoId).finally(() => (encoding = false));
     await watching;
 
     const early = seen.find((s) => s.status === "processing");
@@ -144,7 +131,7 @@ describe("upload to playback", () => {
 
     const media = await agent.get(`/media/${videoId}/360p/index.m3u8`).expect(200);
     const segments = media.text.split("\n").filter((l) => l.endsWith(".ts"));
-    expect(segments.length).toBe(2); // 7 seconds cut into 6 second chunks
+    expect(segments.length).toBe(2); // 7 seconds cut at 6 second boundaries
     await agent.get(`/media/${videoId}/360p/${segments[0]}`).expect(200);
     // Both renditions cut at the same timestamps, so players can switch between them at any segment.
     const hd = await agent.get(`/media/${videoId}/720p/index.m3u8`).expect(200);
@@ -153,116 +140,14 @@ describe("upload to playback", () => {
     await agent.get(body.video.thumbnailUrl).expect(200);
   });
 
-  it("encodes each chunk as its own task and stitches them into one continuous timeline", async () => {
-    const { rows } = await pool.query(
-      "SELECT kind, tier, chunk, status, duration_seconds FROM encode_tasks WHERE video_id = $1 ORDER BY kind, tier, chunk",
-      [videoId],
-    );
-    // Audio once, then 2 chunks for 360p (tier 0) and 2 for 720p (tier 1).
-    expect(rows.map((r) => `${r.kind} ${r.tier} ${r.chunk} ${r.status}`)).toEqual([
-      "audio 0 0 done", "video 0 0 done", "video 0 1 done", "video 1 0 done", "video 1 1 done",
-    ]);
-
-    const dir = path.join(storage, "videos", videoId);
-    const probe = (file: string, entries: string) =>
-      execFileSync("ffprobe", ["-v", "error", "-show_entries", entries, "-of", "csv=p=0", path.join(dir, file)]).toString().trim().split("\n")[0];
-    for (const rung of ["360p", "720p"]) {
-      // Segment 1 starts exactly where segment 0 ends, so the player sees no gap or overlap at the chunk edge.
-      const [start0, length0] = probe(`${rung}/segment_0000.ts`, "stream=start_time,duration").split(",").map(Number);
-      const start1 = Number(probe(`${rung}/segment_0001.ts`, "stream=start_time"));
-      expect(start1).toBeCloseTo(start0 + length0, 3);
-      // Every source frame lands in exactly one chunk: 7 s at 25 fps.
-      const frames = ["segment_0000.ts", "segment_0001.ts"].map((f) =>
-        Number(execFileSync("ffprobe", ["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", path.join(dir, rung, f)]).toString().trim().split("\n")[0]),
-      );
-      expect(frames[0] + frames[1]).toBe(175);
-    }
-
-    // Audio is encoded once, as its own playlist that every rendition shares, starting with the video.
-    const master = await agent.get(`/media/${videoId}/master.m3u8`).expect(200);
-    expect(master.text).toContain('TYPE=AUDIO,GROUP-ID="audio"');
-    const audio = await agent.get(`/media/${videoId}/audio/index.m3u8`).expect(200);
-    const audioFirst = audio.text.split("\n").find((l) => l.endsWith(".ts"))!;
-    await agent.get(`/media/${videoId}/audio/${audioFirst}`).expect(200);
-    const videoStart = Number(probe("360p/segment_0000.ts", "stream=start_time"));
-    expect(Number(probe(`audio/${audioFirst}`, "stream=start_time"))).toBeCloseTo(videoStart, 1);
-  });
-
   it("keeps published renditions when the job runs again, as a retry would", async () => {
     const segment = path.join(storage, "videos", videoId, "720p", "segment_0000.ts");
     const before = fs.statSync(segment).mtimeMs;
-    expect(await planVideo(videoId)).toEqual([]); // Every task is already done, so nothing is queued.
+    await processVideo(videoId);
     expect(fs.statSync(segment).mtimeMs).toBe(before);
     const { body } = await agent.get(`/api/videos/${videoId}`).expect(200);
     expect(body.video.status).toBe("ready");
     expect(body.video.renditions).toHaveLength(2);
-  });
-
-  it("keeps the renditions that finished when a chunk fails for good", async () => {
-    // Run this video's tasks by hand, with no workers, so one of them can fail on cue.
-    await workers?.close();
-    workers = undefined;
-    const { rows } = await pool.query(
-      "INSERT INTO videos (user_id, title, status) SELECT user_id, 'failing chunk', 'queued' FROM videos WHERE id = $1 RETURNING id",
-      [videoId],
-    );
-    const id: string = rows[0].id;
-    fs.mkdirSync(path.join(storage, "videos", id), { recursive: true });
-    fs.copyFileSync(sample, path.join(storage, "videos", id, "source.mp4"));
-
-    const tasks = await planVideo(id);
-    expect(tasks.map((t) => `${t.kind} ${t.tier} ${t.chunk}`)).toEqual(["audio 0 0", "video 0 0", "video 0 1", "video 1 0", "video 1 1"]);
-    for (const t of tasks.slice(0, 3)) await runTask(t);
-    let { body } = await agent.get(`/api/videos/${id}`).expect(200);
-    expect(body.video.status).toBe("processing");
-    expect(body.video.renditions.map((r: { name: string }) => r.name)).toEqual(["360p"]);
-
-    await taskFailed(tasks[3], "ffmpeg exited with 1", true);
-    await runTask(tasks[4]);
-    ({ body } = await agent.get(`/api/videos/${id}`).expect(200));
-    expect(body.video.status).toBe("ready");
-    expect(body.video.renditions.map((r: { name: string }) => r.name)).toEqual(["360p"]);
-    expect(body.video.error).toBe("Encoding chunk 0 failed: ffmpeg exited with 1");
-    const master = await agent.get(body.video.hlsUrl).expect(200);
-    expect(master.text).not.toContain("720p");
-    await encodeChunkQueue().obliterate({ force: true });
-  });
-
-  it("publishes the video without sound when only the audio fails", async () => {
-    const { rows } = await pool.query(
-      "INSERT INTO videos (user_id, title, status) SELECT user_id, 'failing audio', 'queued' FROM videos WHERE id = $1 RETURNING id",
-      [videoId],
-    );
-    const id: string = rows[0].id;
-    fs.mkdirSync(path.join(storage, "videos", id), { recursive: true });
-    fs.copyFileSync(sample, path.join(storage, "videos", id, "source.mp4"));
-
-    const tasks = await planVideo(id);
-    for (const t of tasks.filter((t) => t.kind === "video")) await runTask(t);
-    let { body } = await agent.get(`/api/videos/${id}`).expect(200);
-    expect(body.video.renditions).toEqual([]); // Nothing is published while the audio is still pending.
-    await taskFailed(tasks[0], "no audio decoder", true);
-    ({ body } = await agent.get(`/api/videos/${id}`).expect(200));
-    expect(body.video.status).toBe("ready");
-    expect(body.video.renditions.map((r: { name: string }) => r.name)).toEqual(["720p", "360p"]);
-    expect(body.video.error).toBe("Encoding the audio failed: no audio decoder");
-    const master = await agent.get(body.video.hlsUrl).expect(200);
-    expect(master.text).not.toContain("EXT-X-MEDIA");
-    expect(master.text).not.toContain("mp4a");
-    await encodeChunkQueue().obliterate({ force: true });
-  });
-
-  it("removes the folder of a video deleted while one of its tasks ran", async () => {
-    const { rows } = await pool.query(
-      "INSERT INTO videos (user_id, title, status) SELECT user_id, 'deleted mid-encode', 'queued' FROM videos WHERE id = $1 RETURNING id",
-      [videoId],
-    );
-    const id: string = rows[0].id;
-    const dir = path.join(storage, "videos", id);
-    fs.mkdirSync(path.join(dir, "360p"), { recursive: true });
-    await pool.query("DELETE FROM videos WHERE id = $1", [id]);
-    await taskFailed({ videoId: id, kind: "video", tier: 0, chunk: 0 }, "source.mp4: No such file or directory", true);
-    expect(fs.existsSync(dir)).toBe(false);
   });
 
   it("keeps the original upload private", async () => {
@@ -282,37 +167,29 @@ describe("upload to playback", () => {
     const chunks = events.filter((e) => e.kind === "chunk_received");
     expect(chunks.map((e) => e.data.index).sort((a, b) => a - b)).toEqual(Array.from({ length: totalChunks }, (_, i) => i));
     expect(chunks[chunks.length - 1].data.received).toBe(totalChunks);
-    expect(chunks.every((e) => e.data.offset === e.data.index * chunkSize && e.data.serverMs >= 0)).toBe(true);
 
-    // Then assembly, the queue and the plan, in that order.
+    // Then assembly, the queue and the first encode, in that order.
     const order = ["assembly_started", "assembled", "queued", "encode_started", "probed", "thumbnail", "planned"].map(first);
     expect(order.every((i) => i >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
-    expect(events.find((e) => e.kind === "queued")!.data).toMatchObject({ queue: "transcode", jobId: videoId, attempts: 2 });
     const planned = events.find((e) => e.kind === "planned")!;
     expect(planned.data.segments).toBe(2);
-    expect(planned.data.tasks).toBe(5);
     expect(planned.data.renditions.map((r: any) => [r.name, r.group])).toEqual([["720p", 1], ["360p", 0]]);
-    // One ffmpeg command per tier, shown for chunk 0 with paths relative to the video folder.
-    expect(planned.data.groups.map((g: any) => [g.renditions, g.priority])).toEqual([[["360p"], 1], [["720p"], 2]]);
-    expect(planned.data.groups[0].command.join(" ")).toContain("360p/segment_0000.ts");
+    // The exact ffmpeg runs, paths relative to the video folder: 360p alone, then 720p at a lower priority.
+    expect(planned.data.groups.map((g: any) => [g.renditions, g.nice])).toEqual([[["360p"], 0], [["720p"], 10]]);
+    expect(planned.data.groups[0].command).toContain("360p/index.m3u8");
     expect(planned.data.groups[0].command.join(" ")).not.toContain(storage);
-    expect(planned.data.audio.command.join(" ")).not.toContain(storage);
+    expect(events.find((e) => e.kind === "queued")!.data).toMatchObject({ queue: "transcode", jobId: videoId, attempts: 2 });
+    expect(chunks.every((e) => e.data.offset === e.data.index * chunkSize && e.data.serverMs >= 0)).toBe(true);
 
-    // Every task starts and finishes, and each chunk's segment lands before its rendition is published.
+    // Both renditions' two segments, each before its rendition is published; 360p is published first.
     const firstRun = events.slice(0, events.findIndex((e) => e.kind === "ready") + 1);
-    const done = firstRun.filter((e) => e.kind === "task_done");
-    expect(done.map((e) => `${e.data.kind} ${e.data.tier} ${e.data.chunk}`).sort()).toEqual([
-      "audio 0 0", "video 0 0", "video 0 1", "video 1 0", "video 1 1",
-    ]);
-    expect(firstRun.filter((e) => e.kind === "task_started")).toHaveLength(5);
     const segments = (name: string) => firstRun.filter((e) => e.kind === "segment" && e.data.rendition === name);
     for (const name of ["360p", "720p"]) {
-      // Chunks run in parallel, so their segments can finish in either order.
-      expect(segments(name).map((e) => e.data.index).sort()).toEqual([0, 1]);
+      expect(segments(name).map((e) => e.data.index)).toEqual([0, 1]);
       expect(segments(name).every((e) => e.data.bytes > 0)).toBe(true);
       const published = firstRun.findIndex((e) => e.kind === "published" && e.data.added.includes(name));
-      expect(Math.max(...segments(name).map((e) => firstRun.indexOf(e)))).toBeLessThan(published);
+      expect(firstRun.indexOf(segments(name)[1])).toBeLessThan(published);
     }
     expect(firstRun.filter((e) => e.kind === "published").map((e) => e.data.added)).toEqual([["360p"], ["720p"]]);
 

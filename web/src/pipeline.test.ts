@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeEvent, eventsBy, interpolatedFractions, masterPlaylistLines, pipelineState, replayTimes, type PipelineEvent } from "./pipeline";
+import { eventsBy, interpolatedFractions, masterPlaylistLines, pipelineState, replayTimes, type PipelineEvent } from "./pipeline";
 
 // A short run shaped like what the server records: 3 chunks, a queue wait, then 360p first and 720p after.
 let id = 0;
@@ -77,12 +77,10 @@ describe("pipelineState", () => {
     expect(large.publishedAt).toBeNull();
     expect(large.fraction).toBe(0.6);
     expect(s.playableAt! - s.queuedAt!).toBe(62_380);
-    expect(masterPlaylistLines(s.lanes, true)).toEqual([
+    expect(masterPlaylistLines(s.lanes)).toEqual([
       "#EXTM3U",
       "#EXT-X-VERSION:3",
-      "#EXT-X-INDEPENDENT-SEGMENTS",
-      '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio/index.m3u8"',
-      '#EXT-X-STREAM-INF:BANDWIDTH=1082000,RESOLUTION=640x360,CODECS="avc1.4d4028,mp4a.40.2",NAME="360p",AUDIO="audio"',
+      '#EXT-X-STREAM-INF:BANDWIDTH=1082000,RESOLUTION=640x360,CODECS="avc1.4d4028,mp4a.40.2",NAME="360p"',
       "360p/index.m3u8",
     ]);
   });
@@ -145,47 +143,5 @@ describe("explainEvent", () => {
     expect(ex.ops.find((o) => o.layer === "HTTP")?.text).toContain("bytes 256–511");
     expect(ex.ops.some((o) => o.layer === "SQL" && o.text.includes("ON CONFLICT"))).toBe(true);
     expect(ex.why).toContain("2.5 ms");
-  });
-});
-
-describe("chunk tasks", () => {
-  const chunked = [
-    ev(0, "encode_started"),
-    ev(10, "probed", { width: 1280, height: 720, durationSeconds: 7, hasAudio: true }),
-    ev(20, "planned", { ...plan(1, 0), tasks: 5, renditions: plan(1, 0).renditions.map((r) => ({ ...r, nice: null })) }),
-    ev(30, "task_started", { kind: "audio", tier: 0, chunk: 0, renditions: ["audio"], worker: "a:1" }),
-    ev(31, "task_started", { kind: "video", tier: 0, chunk: 1, renditions: ["360p"], worker: "b:2" }),
-    ev(40, "segment", { rendition: "360p", index: 1, bytes: 500 }),
-    ev(41, "task_done", { kind: "video", tier: 0, chunk: 1, renditions: ["360p"], worker: "b:2", ms: 1200, bytes: 500 }),
-    ev(42, "task_started", { kind: "video", tier: 0, chunk: 0, renditions: ["360p"], worker: "b:2" }),
-    ev(50, "task_failed", { kind: "video", tier: 0, chunk: 0, renditions: ["360p"], error: "ffmpeg exited with 1", final: false }),
-  ];
-
-  it("counts tasks and marks the chunks being encoded, in any order", () => {
-    let s = pipelineState(chunked, 5);
-    expect(s.tasks).toEqual({ total: 5, running: 2, done: 0, failed: 0, workers: ["a:1", "b:2"] });
-    expect(s.lanes[0].encoding).toEqual([false, true]);
-    s = pipelineState(chunked, 8);
-    expect(s.lanes[0].segments).toEqual([null, 500]);
-    expect(s.lanes[0].encoding).toEqual([true, false]);
-    expect(s.tasks).toMatchObject({ running: 2, done: 1 });
-    // A failed attempt that will be retried is neither running nor failed for good.
-    s = pipelineState(chunked);
-    expect(s.lanes[0].encoding).toEqual([false, false]);
-    expect(s.tasks).toMatchObject({ running: 1, done: 1, failed: 0 });
-  });
-
-  it("counts a task the queue hands out twice as one running task", () => {
-    const again = [...chunked.slice(0, 5), ev(35, "task_started", { kind: "video", tier: 0, chunk: 1, renditions: ["360p"], worker: "c:3" })];
-    expect(pipelineState(again).tasks.running).toBe(2);
-    // A failure recorded without a start (the source vanished) never makes the count negative.
-    const orphan = [...chunked.slice(0, 3), ev(32, "task_failed", { kind: "video", tier: 1, chunk: 0, error: "gone", final: true })];
-    expect(pipelineState(orphan).tasks).toMatchObject({ running: 0, failed: 1 });
-  });
-
-  it("describes each task in the log", () => {
-    expect(describeEvent(chunked[2])).toBe("Encoding 720p, 360p: 2 chunks of 6 s, 5 encode tasks queued");
-    expect(describeEvent(chunked[6])).toBe("Chunk 1 of 360p done in 1.20 s, 500 B");
-    expect(describeEvent(chunked[8])).toBe("Chunk 0 of 360p failed: ffmpeg exited with 1 Retrying.");
   });
 });

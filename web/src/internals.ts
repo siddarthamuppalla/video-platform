@@ -93,10 +93,10 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
         nodes: ["redis", "worker", "postgres"],
         edges: ["redis-worker", "worker-postgres"],
         ops: [
-          { layer: "Queue", text: `Worker("${d.queue ?? "transcode"}", {concurrency: 2}) takes job ${d.jobId ?? ""}: attempt ${d.attempt ?? s.attempts} of ${d.maxAttempts ?? "?"}${d.pid ? `, worker pid ${d.pid}` : ""}` },
-          { layer: "SQL", text: "UPDATE videos SET status = 'processing', stage = 'Reading file', error = NULL;" },
+          { layer: "Queue", text: `Worker("${d.queue ?? "transcode"}", {concurrency: 1}) takes job ${d.jobId ?? ""}: attempt ${d.attempt ?? s.attempts} of ${d.maxAttempts ?? "?"}${d.pid ? `, worker pid ${d.pid}` : ""}` },
+          { layer: "SQL", text: "UPDATE videos SET status = 'processing', progress = 0, error = NULL;" },
         ],
-        why: "A separate worker process takes the job off the queue. This job only plans the encode: it reads the file, decides the qualities, cuts the timeline into chunks and queues one encode task per chunk. That is quick, so a worker can plan two videos at once. If this attempt fails, the queue tries again after a short wait, and any qualities that were already finished are kept.",
+        why: "A separate worker process takes the job off the queue. It handles one video at a time because ffmpeg already uses every CPU core; two at once would just make both slower. If this attempt fails, the queue tries again after a short wait, and any qualities that were already finished are kept.",
       };
     case "probed":
       return {
@@ -121,98 +121,37 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
       };
     }
     case "planned":
-      if (typeof d.tasks !== "number") {
-        // Recorded before encodes were split into chunks: one ffmpeg run per group of qualities.
-        return {
-          nodes: ["worker", "ffmpeg"],
-          edges: ["worker-ffmpeg"],
-          ops: (d.groups ?? []).map((g: any) => ({ layer: "Process" as Layer, text: `${g.nice ? `nice -n ${g.nice} ` : ""}${(g.command as string[]).join(" ")}` })),
-          why: `The worker starts ffmpeg once for the smallest quality and once for the rest, each cutting its output into ${d.segments} segments of ${d.segmentSeconds} seconds.`,
-        };
-      }
       return {
-        nodes: ["worker", "postgres", "redis"],
-        edges: ["worker-postgres", "redis-worker"],
-        ops: [
-          { layer: "SQL", text: `UPDATE videos SET encode_plan = '{"chunks": [${d.segments} × ${d.segmentSeconds} s], …}';` },
-          { layer: "SQL", text: `INSERT INTO encode_tasks (video_id, kind, tier, chunk, …) one row per task  ON CONFLICT DO UPDATE SET status = 'queued' WHERE status <> 'done';` },
-          { layer: "SQL", text: `SELECT kind, tier, chunk FROM encode_tasks WHERE status <> 'done';  → ${d.tasks} to encode` },
-          ...(d.audio?.pending ? [{ layer: "Process" as Layer, text: `audio task: ffmpeg ${(d.audio.command as string[]).slice(1).join(" ")}` }] : []),
-          ...(d.groups ?? []).map((g: any) => ({ layer: "Process" as Layer, text: `tier ${g.tier} task, chunk 0: ${(g.command as string[]).join(" ")}` })),
-          { layer: "Queue", text: `Queue("${d.queue ?? "encode-chunk"}").addBulk(${d.tasks} tasks)  priority 1: audio and the smallest quality; 2: the rest` },
-        ],
-        why: `The video is cut into ${d.segments} chunk${d.segments === 1 ? "" : "s"} of ${d.segmentSeconds} seconds, and every chunk of every tier becomes its own task in the queue, so any free worker can take any of them and they all run in parallel. Each chunk is encoded starting from a fresh keyframe and cut at exactly the same frame for every quality, so the finished pieces join back up seamlessly. The soundtrack is encoded once, as its own track, because cutting audio into pieces would leave tiny clicks at every join. The smallest quality and the audio go to the front of the queue so the video becomes watchable as early as possible.`,
+        nodes: ["worker", "ffmpeg"],
+        edges: ["worker-ffmpeg"],
+        ops: (d.groups ?? []).map((g: any) => ({ layer: "Process" as Layer, text: `${g.nice ? `nice -n ${g.nice} ` : ""}${(g.command as string[]).join(" ")}` })),
+        why: `The worker now starts ffmpeg, the program that does the encoding. Each quality will be cut into ${d.segments} segments of ${d.segmentSeconds} seconds. The smallest quality gets its own ffmpeg run at full priority, so the video becomes watchable as early as possible. The larger qualities share a second run, which reads the original only once and resizes it for each, at a lower priority ("nice") so it never slows the first.`,
       };
-    case "task_started":
-    case "task_done":
-    case "task_failed": {
-      const what = d.kind === "audio" ? "the soundtrack" : `chunk ${d.chunk} of ${(d.renditions ?? []).join(", ")}`;
-      const job = `${d.kind}-${d.tier}-${d.chunk}`;
-      if (e.kind === "task_started") {
-        return {
-          nodes: ["redis", "worker", "ffmpeg", "postgres"],
-          edges: ["redis-worker", "worker-ffmpeg", "worker-postgres"],
-          ops: [
-            { layer: "Queue", text: `Worker("encode-chunk") on ${d.worker} takes job <videoId>-${job}${d.attempt > 1 ? `, attempt ${d.attempt}` : ""}` },
-            { layer: "SQL", text: `UPDATE encode_tasks SET status = 'running', attempts = attempts + 1, worker = '${d.worker}' WHERE … AND status <> 'done';` },
-            { layer: "Process", text: d.kind === "audio" ? "ffmpeg -i source -map 0:a:0 -c:a aac … -f hls audio.<run>.tmp/index.m3u8" : `ffmpeg -ss <start − 1 s> -copyts -i source … trim=<start>:<end> … ${(d.renditions ?? [])[0] ?? ""}/segment_${pad(d.chunk, 4)}.ts.<run>.tmp` },
-          ],
-          why: `A worker takes ${what} off the queue. Each worker runs several tasks at once and splits its CPU cores between them. A task that is already done is skipped. If the queue hands out a task again while it is still running (it does when a worker looks stalled), each run writes to its own temporary file, so the two never mix and the result is the same.`,
-        };
-      }
-      if (e.kind === "task_done") {
-        return {
-          nodes: ["ffmpeg", "disk", "worker", "postgres"],
-          edges: ["ffmpeg-disk", "worker-ffmpeg", "worker-postgres"],
-          ops: [
-            { layer: "Disk", text: d.kind === "audio" ? "rename audio.<run>.tmp/ → audio/  (index.m3u8 and its segments)" : `rename segment_${pad(d.chunk, 4)}.ts.<run>.tmp → segment_${pad(d.chunk, 4)}.ts in ${(d.renditions ?? []).join(", ")}` },
-            { layer: "SQL", text: `UPDATE encode_tasks SET status = 'done', duration_seconds = ${d.durationSeconds ?? "NULL"}, bytes = ${d.bytes ?? 0} WHERE …;` },
-            { layer: "SQL", text: "SELECT … FROM videos WHERE id = … FOR UPDATE;  -- then publish any quality whose chunks are all done" },
-          ],
-          why: `${what[0].toUpperCase()}${what.slice(1)} took ${((d.ms ?? 0) / 1000).toFixed(2)} s. Each finished file is written under a temporary name and renamed, so a half-written chunk is never served. The worker then locks the video's row and checks whether this was the last chunk a quality was waiting for; the lock means that when two workers finish a quality's last two chunks at the same moment, exactly one of them publishes it.`,
-        };
-      }
-      return {
-        nodes: ["worker", "redis", "postgres"],
-        edges: ["redis-worker", "worker-postgres"],
-        ops: [
-          { layer: "Queue", text: d.final ? `job <videoId>-${job} failed on its last attempt` : `job <videoId>-${job} failed; BullMQ retries it after a short wait` },
-          { layer: "SQL", text: `UPDATE encode_tasks SET status = '${d.final ? "failed" : "queued"}', error = '${String(d.error).slice(0, 80)}' WHERE …;` },
-        ],
-        why: d.final
-          ? d.kind === "audio"
-            ? "The soundtrack could not be encoded. The qualities are still published, without sound, and the error is kept for the video's owner."
-            : `${what[0].toUpperCase()}${what.slice(1)} could not be encoded, so ${(d.renditions ?? []).join(", ") || "that tier"} can't be published. Only this one task failed: the other qualities still finish and are published, and the error is kept for the video's owner.`
-          : `Only this one task is retried, not the whole video: a failure costs ${d.kind === "audio" ? "one audio encode" : "one chunk"} of work.`,
-      };
-    }
     case "encode_progress":
       return {
         nodes: ["ffmpeg", "worker", "postgres"],
         edges: ["worker-ffmpeg", "worker-postgres"],
         ops: [
-          { layer: "SQL", text: "SELECT kind, tier, chunk, status FROM encode_tasks WHERE video_id = …;" },
-          { layer: "SQL", text: "UPDATE videos SET progress = …, stage = 'Encoding … (done/total chunks)';" },
+          { layer: "Process", text: "ffmpeg -progress pipe:1 → stdout: out_time_us=… (parsed as position / duration)" },
+          { layer: "SQL", text: "UPDATE videos SET progress = …, stage = …;   (at most once a second)" },
         ],
-        why: "Each quality's progress is the share of its chunks that are done. The overall percentage is weighted by picture size, because a 1080p chunk takes far more work than a 360p one.",
+        why: "ffmpeg reports how far through the video it is. The worker turns that into a percentage, weighted by picture size because a 1080p frame takes far more work than a 360p one, and saves it at most once a second to avoid flooding the database.",
       };
     case "segment":
       return {
         nodes: ["ffmpeg", "disk", "worker", "postgres"],
         edges: ["ffmpeg-disk", "worker-ffmpeg", "worker-postgres"],
         ops: [
+          { layer: "Process", text: `stderr: [hls] Opening '${d.rendition}/segment_${pad(d.index + 1, 4)}.ts' for writing  ⇒ segment ${d.index} is closed` },
           { layer: "Disk", text: `${d.rendition}/segment_${pad(d.index, 4)}.ts  ${d.bytes ? `${d.bytes} bytes (${formatBytes(d.bytes)})` : ""}` },
         ],
-        why: `Chunk ${d.index} of ${d.rendition} is on disk as one HLS segment. Every chunk starts with a full picture (a keyframe) and is cut at the same frame for every quality, so a player can switch quality between any two segments without a jump.${d.bytes && s.segmentSeconds && d.index < s.segmentCount - 1 ? ` This segment works out to about ${Math.round((d.bytes * 8) / s.segmentSeconds / 1000)} kilobits per second of video; the sound is in its own playlist.` : ""}`,
+        why: `ffmpeg announces when it starts writing the next segment, which tells the worker the previous one is complete. Every ${s.segmentSeconds} seconds ffmpeg is told to store a full picture (a keyframe), so every quality is cut at exactly the same moments. That is what lets a player switch quality between any two segments without a jump.${d.bytes && s.segmentSeconds ? ` This segment works out to about ${Math.round((d.bytes * 8) / s.segmentSeconds / 1000)} kilobits per second, including sound.` : ""}`,
       };
     case "published":
       return {
         nodes: ["worker", "disk", "postgres", "api", "nginx", "browser"],
         edges: ["worker-disk", "worker-postgres", "api-disk", "nginx-api", "browser-nginx"],
         ops: [
-          ...(s.chunked
-            ? (d.added as string[]).map((r) => ({ layer: "Disk" as Layer, text: `write ${r}/index.m3u8: one #EXTINF line per chunk, from each task's recorded length` }))
-            : []),
           { layer: "Disk", text: `write master.m3u8.tmp, then rename → master.m3u8  (${d.renditions.length} variant${d.renditions.length === 1 ? "" : "s"})` },
           { layer: "SQL", text: `UPDATE videos SET renditions = '[${(d.renditions as string[]).map((r) => `"${r}"`).join(", ")}]', playable_at = COALESCE(playable_at, now());` },
           { layer: "HTTP", text: "GET /media/<videoId>/master.m3u8   Cache-Control: no-cache" },
@@ -221,14 +160,6 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
         why: "This quality is now watchable. Its line is added to the master playlist, the index players read first. The file is written under a temporary name and renamed, so a player never reads half of it. Players are told not to cache the playlist, because it changes as qualities are added, but to cache segments for a year, because a finished segment never changes.",
       };
     case "ready":
-      if (s.chunked) {
-        return {
-          nodes: ["worker", "postgres"],
-          edges: ["worker-postgres"],
-          ops: [{ layer: "SQL", text: "UPDATE videos SET status = 'ready', progress = 100, stage = NULL, ready_at = now();" }],
-          why: "The last encode task has finished, so the worker that ran it marks the video ready. The original upload stays on disk in case it is needed again, but it is never served to viewers.",
-        };
-      }
       return {
         nodes: ["worker", "postgres", "redis"],
         edges: ["worker-postgres", "redis-worker"],
@@ -239,15 +170,6 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
         why: "Every quality is finished and the job is marked complete. The original upload stays on disk in case it is needed again, but it is never served to viewers.",
       };
     case "failed":
-      if (d.allTasksFinished) {
-        // Every task has finished, and no quality could be published.
-        return {
-          nodes: ["worker", "postgres"],
-          edges: ["worker-postgres"],
-          ops: [{ layer: "SQL", text: `UPDATE videos SET status = 'failed', error = '${String(d.error).slice(0, 80)}';` }],
-          why: "Every encode task has finished, but at least one chunk of every quality failed for good, so there is nothing to play. The error is kept for the video's owner.",
-        };
-      }
       return {
         nodes: ["worker", "redis", "postgres"],
         edges: ["redis-worker", "worker-postgres"],
