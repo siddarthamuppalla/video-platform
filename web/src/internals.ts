@@ -39,7 +39,7 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
           { layer: "SQL", text: `INSERT INTO uploads (…, size, chunk_size, total_chunks) VALUES (…, ${d.size}, ${d.chunkSize}, ${d.totalChunks}); COMMIT;` },
           { layer: "Disk", text: "mkdir /data/uploads/<uploadId>/" },
         ],
-        why: `The server picks the chunk size, so it can validate every chunk's length: ceil(${d.size} / ${d.chunkSize}) = ${d.totalChunks} chunks. The video row exists before any bytes arrive, which makes the upload resumable from the first chunk.`,
+        why: `The browser announces the file before sending any of it. The server chooses the piece size, so it knows exactly how long every piece must be: ${d.size} bytes ÷ ${d.chunkSize} = ${d.totalChunks} pieces. It saves a record of the upload right away, so if the connection drops at any point the upload can resume instead of starting over.`,
       };
     case "chunk_received": {
       const offset = d.offset ?? (u ? d.index * u.chunkSize : 0);
@@ -52,7 +52,7 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
           { layer: "SQL", text: `INSERT INTO upload_chunks (upload_id, idx, size) VALUES (…, ${d.index}, ${d.size}) ON CONFLICT (upload_id, idx) DO UPDATE SET size = EXCLUDED.size;` },
           { layer: "SQL", text: `SELECT count(*) FROM upload_chunks WHERE upload_id = …;  → ${d.received}` },
         ],
-        why: `PUT to a fixed index is idempotent: a retried chunk overwrites itself and the upsert keeps one row, so retries are always safe. The rename is atomic, so a half-written chunk is never mistaken for a whole one.${typeof d.serverMs === "number" ? ` The server spent ${d.serverMs} ms on this request once the body had arrived.` : ""}`,
+        why: `Each piece goes to its own numbered address, so sending it twice just replaces it with the same bytes; that is what makes retries safe (idempotent). The piece is written under a temporary name and then renamed, so a piece cut off halfway is never mistaken for a complete one. The database row records that this piece arrived, which is how a resumed upload knows what is still missing.${typeof d.serverMs === "number" ? ` The server spent ${d.serverMs} ms on this request after the bytes arrived.` : ""}`,
       };
     }
     case "assembly_started":
@@ -75,8 +75,8 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
               ],
         why:
           e.kind === "assembly_started"
-            ? "Chunks may arrive in any order, so they are stitched by index. Only one chunk is held in memory at a time, so memory stays flat no matter how big the file is."
-            : `The reassembled file is checked byte for byte against the size announced at the start (${formatBytes(d.size)}) before anything is queued.`,
+            ? "The browser has said it is done. The server first checks that every piece really arrived, then joins them by number, because they may have arrived out of order. It reads one piece at a time, so memory use stays small even for a very large file."
+            : `The rebuilt file's size is checked against the size announced at the start (${formatBytes(d.size)}), which catches any missing or damaged piece before encoding. The pieces are then deleted because the whole file now exists.`,
       };
     case "queued":
       return {
@@ -86,7 +86,7 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
           { layer: "SQL", text: "UPDATE videos SET status = 'queued', stage = 'Waiting for encoder';" },
           { layer: "Queue", text: `BullMQ Queue("${d.queue ?? "transcode"}").add("transcode", {videoId}, {jobId: "${d.jobId ?? "<videoId>"}", attempts: ${d.attempts ?? 2}, backoff: ${d.backoffMs ?? 5000} ms})` },
         ],
-        why: "The HTTP request returns now; encoding happens in a separate worker process. Using the video id as the job id makes enqueueing idempotent, so completing an upload twice can't encode it twice. Redis holds the job until a worker is free.",
+        why: "The upload request finishes here and the browser gets its answer immediately. The encoding is handed off as a job to a queue in Redis, where it waits until a worker is free. The job is named after the video, so even if the upload were completed twice, the video would only be encoded once.",
       };
     case "encode_started":
       return {
@@ -96,7 +96,7 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
           { layer: "Queue", text: `Worker("${d.queue ?? "transcode"}", {concurrency: 1}) takes job ${d.jobId ?? ""}: attempt ${d.attempt ?? s.attempts} of ${d.maxAttempts ?? "?"}${d.pid ? `, worker pid ${d.pid}` : ""}` },
           { layer: "SQL", text: "UPDATE videos SET status = 'processing', progress = 0, error = NULL;" },
         ],
-        why: "The worker runs one job at a time because ffmpeg already uses every core; a second job would only slow both down. If this attempt throws, BullMQ retries it after the backoff, and renditions already published are kept.",
+        why: "A separate worker process takes the job off the queue. It handles one video at a time because ffmpeg already uses every CPU core; two at once would just make both slower. If this attempt fails, the queue tries again after a short wait, and any qualities that were already finished are kept.",
       };
     case "probed":
       return {
@@ -106,7 +106,7 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
           { layer: "Process", text: `ffprobe -v error -print_format json -show_format -show_streams ${s.job?.source ?? "source"}` },
           { layer: "SQL", text: `UPDATE videos SET duration_seconds = ${d.durationSeconds}, width = ${d.width}, height = ${d.height};` },
         ],
-        why: `Everything after this depends on the source: the rungs to encode (never above ${Math.min(d.width, d.height)}p, the short side), the segment count, and whether there is an audio track to map.`,
+        why: `Everything that follows depends on these facts. The qualities to make are chosen from them (never larger than the original's ${Math.min(d.width, d.height)}p, because upscaling adds size without adding detail), the length decides how many segments there will be, and the audio check decides whether to include sound.`,
       };
     case "thumbnail": {
       const at = s.probe ? (s.probe.durationSeconds * 0.1).toFixed(2) : "10%";
@@ -117,7 +117,7 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
           { layer: "Process", text: `ffmpeg -ss ${at} -i ${s.job?.source ?? "source"} -frames:v 1 -vf scale=640:-2 -q:v 3 thumbnail.jpg` },
           { layer: "Disk", text: "write /data/videos/<videoId>/thumbnail.jpg" },
         ],
-        why: "The frame is taken 10% in rather than at 0, which skips black intro frames more often. Seeking before -i makes ffmpeg jump to the nearest keyframe instead of decoding from the start.",
+        why: "The picture is taken 10% of the way in, because the very first frame is often black. Asking ffmpeg to jump there before opening the file lets it skip straight to that point instead of decoding everything before it.",
       };
     }
     case "planned":
@@ -125,7 +125,7 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
         nodes: ["worker", "ffmpeg"],
         edges: ["worker-ffmpeg"],
         ops: (d.groups ?? []).map((g: any) => ({ layer: "Process" as Layer, text: `${g.nice ? `nice -n ${g.nice} ` : ""}${(g.command as string[]).join(" ")}` })),
-        why: `${d.segments} segments of ${d.segmentSeconds} s per quality. The smallest rendition runs alone at full priority so the video becomes playable fast; the rest share one ffmpeg run that decodes the source once and splits the frames, at a lower CPU priority so they never slow the first one down.`,
+        why: `The worker now starts ffmpeg, the program that does the encoding. Each quality will be cut into ${d.segments} segments of ${d.segmentSeconds} seconds. The smallest quality gets its own ffmpeg run at full priority, so the video becomes watchable as early as possible. The larger qualities share a second run, which reads the original only once and resizes it for each, at a lower priority ("nice") so it never slows the first.`,
       };
     case "encode_progress":
       return {
@@ -135,7 +135,7 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
           { layer: "Process", text: "ffmpeg -progress pipe:1 → stdout: out_time_us=… (parsed as position / duration)" },
           { layer: "SQL", text: "UPDATE videos SET progress = …, stage = …;   (at most once a second)" },
         ],
-        why: "Progress is weighted by pixel count, so the overall bar moves at an even pace even though the renditions differ a lot in cost.",
+        why: "ffmpeg reports how far through the video it is. The worker turns that into a percentage, weighted by picture size because a 1080p frame takes far more work than a 360p one, and saves it at most once a second to avoid flooding the database.",
       };
     case "segment":
       return {
@@ -145,7 +145,7 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
           { layer: "Process", text: `stderr: [hls] Opening '${d.rendition}/segment_${pad(d.index + 1, 4)}.ts' for writing  ⇒ segment ${d.index} is closed` },
           { layer: "Disk", text: `${d.rendition}/segment_${pad(d.index, 4)}.ts  ${d.bytes ? `${d.bytes} bytes (${formatBytes(d.bytes)})` : ""}` },
         ],
-        why: `ffmpeg forces a keyframe every ${s.segmentSeconds} s (-force_key_frames, -sc_threshold 0), so every rendition cuts at the same timestamps. That alignment is what lets a player switch quality at any segment boundary.${d.bytes && s.segmentSeconds ? ` This one averages ${Math.round((d.bytes * 8) / s.segmentSeconds / 1000)} kb/s including audio.` : ""}`,
+        why: `ffmpeg announces when it starts writing the next segment, which tells the worker the previous one is complete. Every ${s.segmentSeconds} seconds ffmpeg is told to store a full picture (a keyframe), so every quality is cut at exactly the same moments. That is what lets a player switch quality between any two segments without a jump.${d.bytes && s.segmentSeconds ? ` This segment works out to about ${Math.round((d.bytes * 8) / s.segmentSeconds / 1000)} kilobits per second, including sound.` : ""}`,
       };
     case "published":
       return {
@@ -157,7 +157,7 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
           { layer: "HTTP", text: "GET /media/<videoId>/master.m3u8   Cache-Control: no-cache" },
           { layer: "Player", text: `hls.js reloads the master playlist and adds ${(d.added as string[]).join(", ")} to its levels` },
         ],
-        why: "The playlist is written to a temp file and renamed, so a player fetching it mid-write never sees half a file. Playlists are no-cache because they change; segments are cached for a year because they never do.",
+        why: "This quality is now watchable. Its line is added to the master playlist, the index players read first. The file is written under a temporary name and renamed, so a player never reads half of it. Players are told not to cache the playlist, because it changes as qualities are added, but to cache segments for a year, because a finished segment never changes.",
       };
     case "ready":
       return {
@@ -167,7 +167,7 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
           { layer: "SQL", text: "UPDATE videos SET status = 'ready', progress = 100, ready_at = now();" },
           { layer: "Queue", text: "job completed; BullMQ keeps the last 100 completed jobs" },
         ],
-        why: "Every rung is encoded. The source file stays on disk but is never served: /media refuses source.* paths.",
+        why: "Every quality is finished and the job is marked complete. The original upload stays on disk in case it is needed again, but it is never served to viewers.",
       };
     case "failed":
       return {
@@ -177,7 +177,7 @@ export function explainEvent(e: PipelineEvent, s: PipelineState): Explanation {
           { layer: "Queue", text: d.final ? "job failed on its last attempt" : "job failed; BullMQ schedules a retry after the backoff" },
           { layer: "SQL", text: `UPDATE videos SET error = '${String(d.error).slice(0, 80)}', status = …;` },
         ],
-        why: "A video that already has published renditions stays watchable: a retry keeps them, and after the last attempt it is marked ready with what it has.",
+        why: "If the video already has finished qualities it stays watchable: a retry keeps them, and if the last attempt also fails, the video is shown with the qualities it has.",
       };
     default:
       return { nodes: [], edges: [], ops: [], why: "" };
