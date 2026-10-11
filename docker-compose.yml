@@ -38,6 +38,8 @@ services:
     command: ["node", "dist/worker.js"]
     environment: *server-env
     # The worker reads the reassembled source and writes HLS output into the same volume the API serves.
+    # It plans videos and encodes their 6 s chunks, one task per core at a time. Extra workers on other machines
+    # sharing this database, Redis and storage would take chunks of the same video in parallel.
     volumes:
       - media:/data
     depends_on:
