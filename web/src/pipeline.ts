@@ -15,7 +15,7 @@ export type Lane = {
   videoKbps: number;
   bandwidth: number;
   codecs: string;
-  /** 0 is encoded first and alone; 1 is the shared run of the larger ones; -1 was kept from an earlier attempt. */
+  /** The ffmpeg run that encodes it, smallest first (0 runs at full priority); -1 was kept from an earlier attempt. */
   group: number;
   nice: number | null;
   fraction: number;

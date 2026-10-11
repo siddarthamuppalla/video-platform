@@ -73,9 +73,9 @@ describe("masterPlaylist", () => {
 describe("encodeGroups", () => {
   const names = (w: number, h: number) => encodeGroups(planRenditions(w, h)).map((g) => g.map((r) => r.name));
 
-  it("encodes the smallest rendition on its own first, then everything else together", () => {
-    expect(names(3840, 2160)).toEqual([["360p"], ["720p", "1080p", "1440p", "2160p"]]);
-    expect(names(1920, 1080)).toEqual([["360p"], ["720p", "1080p"]]);
+  it("encodes every rendition on its own, smallest first, so each can be published when it is done", () => {
+    expect(names(3840, 2160)).toEqual([["360p"], ["720p"], ["1080p"], ["1440p"], ["2160p"]]);
+    expect(names(1920, 1080)).toEqual([["360p"], ["720p"], ["1080p"]]);
     expect(names(1280, 720)).toEqual([["360p"], ["720p"]]);
   });
 
@@ -87,9 +87,9 @@ describe("encodeGroups", () => {
 
 describe("encodeArgs", () => {
   const src = { durationSeconds: 10, width: 1920, height: 1080, hasAudio: true };
-  const [, rest] = encodeGroups(planRenditions(1920, 1080));
+  const rest = planRenditions(1920, 1080).filter((r) => r.name !== "360p").reverse();
 
-  it("decodes the source once and splits it for each rendition", () => {
+  it("decodes the source once and splits it when one run encodes several renditions", () => {
     const args = encodeArgs("/v/source.mp4", "/v", rest, src);
     expect(args.filter((a) => a === "-i")).toHaveLength(1);
     expect(args[args.indexOf("-filter_complex") + 1]).toBe(

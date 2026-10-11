@@ -604,7 +604,7 @@ const LaneRow = memo(function LaneRow({
   const status =
     lane.publishedAt !== null ? (lane.group < 0 ? "Kept" : "Playable") : fraction > 0 ? `${Math.floor(fraction * 100)}%` : "Waiting";
   const role =
-    lane.group < 0 ? "kept from an earlier attempt" : lane.group === 0 ? "encoded first, full priority" : `shared run, nice ${lane.nice ?? 0}`;
+    lane.group < 0 ? "kept from an earlier attempt" : lane.group === 0 ? "encoded first, full priority" : `lower priority, nice ${lane.nice ?? 0}`;
 
   return (
     <li className={`pipeline-lane${lane.publishedAt !== null ? " pipeline-lane--published" : ""}`}>

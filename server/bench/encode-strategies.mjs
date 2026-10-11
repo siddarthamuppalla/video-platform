@@ -57,6 +57,8 @@ function run(args, nice = 0) {
 }
 
 const asc = [...plan].reverse();
+// The worker's priorities, from src/pipeline.ts.
+const NICE_LEVELS = [0, 10, 15, 19];
 const smallest = asc[0];
 const rest = asc.slice(1);
 const strategies = {
@@ -87,6 +89,9 @@ const strategies = {
       run(single(smallest, dir)).then(() => mark(smallest.name)),
       rest.length ? run(multi(rest, dir), 10).then(() => rest.forEach((r) => mark(r.name))) : null,
     ]);
+  },
+  "stepped: one process per rendition, all at once, nice 0, 10, 15, 19 smallest first": async (dir, mark) => {
+    await Promise.all(asc.map((r, i) => run(single(r, dir), NICE_LEVELS[Math.min(i, NICE_LEVELS.length - 1)]).then(() => mark(r.name))));
   },
   "tiered: smallest n0, next n5, rest single pass n10": async (dir, mark) => {
     const groups = [[asc[0]], asc.slice(1, 2), asc.slice(2)].filter((g) => g.length);

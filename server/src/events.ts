@@ -15,7 +15,8 @@ import { query } from "./db.js";
  *   probed            { width, height, durationSeconds, hasAudio }
  *   thumbnail         {}
  *   planned           { renditions: [{ name, width, height, videoKbps, bandwidth, codecs, group, nice }], segments, segmentSeconds }
- *                     group is the encode group (0 runs first and alone), or -1 if a retry kept it;
+ *                     group is the rendition's encode group (one per rendition, 0 is the smallest and runs at
+ *                     full priority), or -1 if a retry kept it;
  *                     groups: [{ renditions, nice, command }] is each ffmpeg run's exact arguments
  *   encode_progress   { fractions: { [rendition]: 0..1 } }   at most once a second
  *   segment           { rendition, index, bytes }         an HLS segment finished writing

@@ -72,11 +72,9 @@ For each video the worker:
 1. **Probes** the file with `ffprobe` to get the duration, dimensions and whether there is audio. Phone videos are often stored sideways with a rotation flag, so the width and height are swapped when the flag says 90° or 270°.
 2. **Grabs a thumbnail** 10% of the way in, which skips black intro frames more often than the first frame does.
 3. **Plans renditions** from the ladder: 2160p at 16 Mbps, 1440p at 9 Mbps, 1080p at 5 Mbps, 720p at 2.8 Mbps and 360p at 0.8 Mbps. It only uses rungs at or below the source's resolution, because upscaling adds bytes without adding detail, so a 4K upload gets all five and a 720p upload gets two. The number is the frame's short side, so a 1080×1920 phone video counts as 1080p. Each rung pins its H.264 profile and level (High 5.2 for 2160p, down to Main 4.0 for 720p and 360p), and the master playlist advertises the same values so players know in advance whether they can decode a rendition.
-4. **Encodes the renditions, smallest first**, to H.264 and AAC with `ffmpeg -f hls`, which writes six-second `.ts` segments plus a playlist (`720p/index.m3u8`) listing them. Two ffmpeg processes start at once:
-   - the **smallest rendition** (usually 360p) on its own, at normal CPU priority;
-   - **every other rendition in a single ffmpeg run** at a lower priority (`nice -n 10`). That run decodes the source once and splits the frames into one scaler and encoder per rendition (`-filter_complex "[0:v]split=4[in0]...;[in0]scale=1280:720[out0];..."`), instead of decoding the whole source again for each quality.
+4. **Encodes the renditions, smallest first**, to H.264 and AAC with `ffmpeg -f hls`, which writes six-second `.ts` segments plus a playlist (`720p/index.m3u8`) listing them. **Every rendition gets its own ffmpeg process, and they all start at once**, each at a lower CPU priority than the one below it: 360p at normal priority, then `nice -n 10`, `15` and `19` for 720p, 1080p and the rest.
 
-   Because of the priority difference the 360p encode gets the cores first and finishes almost as fast as it would alone, while the big run soaks up whatever CPU is left, so nothing sits idle. Keyframes are forced every 6 seconds (`-force_key_frames expr:gte(t,n_forced*6)`) in every output, so every rendition's segments start at the same timestamps. That alignment is what lets a player jump from 720p segment 4 to 360p segment 5 without a glitch. Progress comes from ffmpeg's `-progress` output and is written to the database about once a second, weighted by each rendition's pixel count. If one process fails, the other is stopped.
+   Because of the priority steps the 360p encode gets the cores first and finishes almost as fast as it would alone, and each larger rendition finishes after the one below it, while whatever CPU is left is soaked up by the bigger ones, so nothing sits idle. Each quality is published the moment it is done: 360p, then 720p, then 1080p, instead of every quality above 360p arriving together at the end. Keyframes are forced every 6 seconds (`-force_key_frames expr:gte(t,n_forced*6)`) in every output, so every rendition's segments start at the same timestamps. That alignment is what lets a player jump from 720p segment 4 to 360p segment 5 without a glitch. Progress comes from ffmpeg's `-progress` output and is written to the database about once a second, weighted by each rendition's pixel count. If one process fails, the other is stopped.
 5. **Publishes each rendition as soon as it is done.** The worker rewrites the master playlist, `master.m3u8`, to list every finished rendition (writing a temp file and renaming it, so a player never reads half a playlist) and saves the list in the `renditions` column. The first publish makes the video **playable**: it appears on the home page and can be watched in 360p while the larger qualities are still encoding. When the last rendition lands the status becomes `ready`. A finished master playlist looks like this:
 
    ```
@@ -109,7 +107,28 @@ Before this, each rendition was encoded by its own ffmpeg process, largest first
 | Three tiers (360p, 720p, the rest) at three priorities | not run | 7 s / 23 s | 27 s / 127 s |
 | 360p `ultrafast` preview first, then everything in one process | 12 s / 73 s | 4 s / 26 s | 15 s / 119 s |
 
+These measurements predate stepped publishing: "used" was 360p alone plus every larger rendition in one process at a lower priority. See [Publishing each quality as it finishes](#publishing-each-quality-as-it-finishes) for what changed and why.
+
 "Playable" is when the first rendition is done; before this change a video wasn't watchable until everything was done. The chosen strategy makes a video watchable 4 to 7 times sooner and finishes the whole ladder 18 to 27% sooner. Decoding once is where the total saving comes from, and it grows with the source's resolution because decoding 4K is expensive. The fastest total (one process for everything) leaves nothing playable until the end; the priority split costs 12% on 4K to get 360p out in 22 s instead of 101 s. The 1080p clips are real footage from [intel-iot-devkit/sample-videos](https://github.com/intel-iot-devkit/sample-videos); the 4K clip is the 33 s one upscaled with light grain added, because no real 4K footage was reachable from the benchmark machine. Run it yourself with `node server/bench/encode-strategies.mjs <video> <scratch dir>`.
+
+#### Publishing each quality as it finishes
+
+The strategy above published 360p early but every larger quality together at the end, because one process encoded them all and its outputs advance in lockstep. Now each rendition has its own process and priority step, so each one is published as soon as it is done. Measured on a 4-core machine (a different one from the table above, so compare within this table only):
+
+| | 360p | 720p | 1080p | 1440p | 2160p |
+|---|---|---|---|---|---|
+| 1080p clip, 76 s: 360p, then the rest in one process | 35.6 s | 102.7 s | 102.7 s | | |
+| 1080p clip, 76 s: **one process per quality, stepped priority (used)** | **35.2 s** | **74.9 s** | **104.8 s** | | |
+| 4K clip, 33 s: 360p, then the rest in one process | 50.5 s | 226.6 s | 226.6 s | 226.6 s | 226.6 s |
+| 4K clip, 33 s: **one process per quality, stepped priority (used)** | **58.0 s** | **129.8 s** | **206.8 s** | **288.6 s** | **332.9 s** |
+
+The tradeoff is decoding. One process for every larger quality decodes the source once; one process per quality decodes it once each.
+
+- **Pro:** every quality in the middle arrives much sooner. 720p is watchable 28 s (27%) sooner on the 1080p clip and 97 s (43%) sooner on the 4K clip, and 1080p is 20 s sooner on 4K. A viewer on a decent connection gets a sharp picture far earlier.
+- **Free for sources up to 1080p:** there, the extra decodes are cheap and the last quality lands within about 2% of the old time (104.8 s against 102.7 s).
+- **Con for 4K sources:** decoding 4K is expensive, so doing it five times instead of twice makes the top qualities later: 1440p arrives 62 s later and 2160p 106 s (47%) later, and the whole job uses that much more CPU. The 4K test clip here is an upscale with heavy grain at about 200 Mbps, which is much harder to decode than typical 4K camera footage, so this is close to a worst case. Sharing one process between 1440p and 2160p won back only 33 s for 2160p and made 1440p 11 s later (both at 299.5 s), so every quality stays a separate step.
+
+Run it with `node server/bench/encode-strategies.mjs <video> <scratch dir> niced stepped`.
 
 The result on disk:
 
