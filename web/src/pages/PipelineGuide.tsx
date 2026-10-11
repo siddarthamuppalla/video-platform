@@ -33,8 +33,8 @@ export const EXPLAIN = {
     why: "Encoding takes far longer than an HTTP request should. A queue lets the website stay fast while the work waits for a free worker, and it retries the job automatically if it fails. Reading the file first decides everything after it: which qualities to make (never larger than the original) and how many segments each will have.",
   },
   encode: (seconds: number) => ({
-    what: `One row per quality. Each box is a ${seconds}-second segment of video; it turns dark when ffmpeg finishes writing it. A quality is marked Playable the moment all its segments are done and it is added to the playlist.`,
-    why: `The smallest quality is encoded first, on its own and at full speed, so people can start watching within seconds. The bigger qualities share a single ffmpeg run that reads the source once, at a lower CPU priority so they never slow the first one down. Every quality is cut at exactly the same ${seconds}-second marks, which is what lets a player switch quality between any two segments without a glitch.`,
+    what: `One row per quality. Each box is a ${seconds}-second chunk of the video, which becomes one segment. It turns grey while a worker encodes it and dark when it is written. Chunks are encoded in parallel, so boxes can fill out of order. A quality is marked Playable the moment all its chunks are done and its playlist is written.`,
+    why: `Instead of one long ffmpeg run per quality, the video is cut into ${seconds}-second chunks and each chunk is its own task in the queue, so every free CPU core, on any worker, can encode a different chunk at the same time. The smallest quality's chunks and the soundtrack go to the front of the queue, so people can start watching as early as possible; the bigger qualities' chunks follow. Every quality is cut at exactly the same ${seconds}-second marks, and every chunk starts with a keyframe, which is what lets a player switch quality between any two segments without a glitch.`,
   }),
   timeline: {
     what: "The whole journey on one clock, in real time. Each bar is how long a stage took; small ticks are pieces arriving and segments being finished; the green dot is when a quality became watchable. The dashed line is the current moment.",
@@ -63,16 +63,17 @@ export const LAYERS: Record<string, string> = {
 };
 
 const TERMS: { term: string; meaning: string }[] = [
-  { term: "Chunk", meaning: "One fixed-size piece of the uploaded file. Pieces are sent separately and put back together on the server." },
+  { term: "Chunk", meaning: "On upload, one fixed-size piece of the file, sent separately and put back together on the server. On encode, one 6-second stretch of the video, encoded on its own." },
   { term: "Idempotent", meaning: "Safe to repeat. Sending the same chunk twice leaves the same result as sending it once, so retries can't corrupt anything." },
-  { term: "Job queue", meaning: "A list of work waiting to be done (here BullMQ, stored in Redis). The API adds jobs; the worker takes them one at a time." },
+  { term: "Job queue", meaning: "A list of work waiting to be done (here BullMQ, stored in Redis). The API adds jobs; workers take them, several at once." },
   { term: "Rendition", meaning: "One quality of the video, such as 360p or 1080p. Each is a complete copy at a different size and bitrate." },
   { term: "Bitrate", meaning: "How many bits of data one second of video uses. Higher looks better but needs a faster connection." },
   { term: "HLS segment", meaning: "A short file (6 seconds here) holding one slice of one rendition. Players download segments one after another." },
   { term: "Keyframe", meaning: "A frame stored in full rather than as a change from the one before. Every segment starts with one, so it can play on its own." },
   { term: "Master playlist", meaning: "master.m3u8: the index of renditions a player reads first to decide which quality to fetch." },
   { term: "Adaptive streaming", meaning: "The player switching quality while you watch, to match your connection speed." },
-  { term: "nice", meaning: "A Linux setting for process priority. A higher nice value means the process yields the CPU to others." },
+  { term: "Encode task", meaning: "One job in the encode-chunk queue: one chunk of one tier of qualities, or the whole soundtrack. Any worker can take any task, and a failed one is retried on its own." },
+  { term: "Queue priority", meaning: "The order the queue hands tasks out in. Priority 1 (the soundtrack and the smallest quality) always goes before priority 2, across every video." },
   { term: "LISTEN / NOTIFY", meaning: "Postgres's built-in messaging. A trigger announces each new event, and the API, which is listening, is told instantly." },
   { term: "Server-Sent Events", meaning: "A long-lived HTTP response the server keeps writing to. It is how this page receives each step live without asking repeatedly." },
   { term: "Atomic rename", meaning: "Writing to a temporary name and then renaming it. Readers see either the old file or the new one, never half of one." },

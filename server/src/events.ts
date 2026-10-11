@@ -11,17 +11,24 @@ import { query } from "./db.js";
  *   assembly_started  { totalChunks, size }
  *   assembled         { size, file }
  *   queued            { queue, jobId, attempts, backoffMs }
- *   encode_started    { queue, jobId, attempt, maxAttempts, source, pid }   once per attempt
- *   probed            { width, height, durationSeconds, hasAudio }
+ *   encode_started    { queue, jobId, attempt, maxAttempts, source, pid }   once per planning attempt
+ *   probed            { width, height, durationSeconds, startSeconds, hasAudio, seekable }
  *   thumbnail         {}
- *   planned           { renditions: [{ name, width, height, videoKbps, bandwidth, codecs, group, nice }], segments, segmentSeconds }
- *                     group is the encode group (0 runs first and alone), or -1 if a retry kept it;
- *                     groups: [{ renditions, nice, command }] is each ffmpeg run's exact arguments
- *   encode_progress   { fractions: { [rendition]: 0..1 } }   at most once a second
- *   segment           { rendition, index, bytes }         an HLS segment finished writing
+ *   planned           { renditions: [{ name, width, height, videoKbps, bandwidth, codecs, group }], segments, segmentSeconds,
+ *                       chunks, tasks, queue, groups, audio }
+ *                     group is the rendition's encode tier (0 is the smallest, queued first), or -1 if an earlier
+ *                     attempt already published it; tasks is how many encode tasks were queued;
+ *                     groups: [{ tier, renditions, priority, command }] is each tier's ffmpeg arguments for chunk 0;
+ *                     audio: { command, pending } or null
+ *   task_started      { kind, tier, chunk, renditions, worker, attempt }   a worker took one encode task
+ *   segment           { rendition, index, bytes }         a chunk's segment was written for this rendition
+ *   task_done         { kind, tier, chunk, renditions, worker, ms, bytes, durationSeconds }
+ *   task_failed       { kind, tier, chunk, error, final, worker }   final: no attempts left
+ *   encode_progress   { fractions: { [rendition]: 0..1 } }   after every finished task: the share of chunks done
  *   published         { renditions, added }               these renditions joined the master playlist
  *   ready             {}
- *   failed            { error, final }
+ *   failed            { error, final, allTasksFinished? }   from the planning job, or (allTasksFinished) when every
+ *                     task has finished and no rendition could be published
  */
 export type PipelineEvent = { id: number; at: Date; kind: string; data: Record<string, unknown> };
 

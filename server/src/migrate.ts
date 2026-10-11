@@ -52,6 +52,30 @@ CREATE TABLE IF NOT EXISTS uploads (
   created_at   timestamptz NOT NULL DEFAULT now()
 );
 
+-- What the planner decided for a video: renditions, encode tiers, the chunk index and the probe. Every chunk
+-- task reads it, so workers never re-probe the source.
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS encode_plan jsonb;
+
+-- One row per encode task: a video tier for one chunk (tier 0 = the smallest rendition, tier 1 = the rest), or the
+-- video's audio. The queue says what to run next; this table is the durable record the publisher checks, and it
+-- survives restarts and retries.
+CREATE TABLE IF NOT EXISTS encode_tasks (
+  video_id         uuid NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+  kind             text NOT NULL CHECK (kind IN ('video', 'audio')),
+  tier             integer NOT NULL,
+  chunk            integer NOT NULL,
+  renditions       jsonb NOT NULL DEFAULT '[]',
+  status           text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'done', 'failed')),
+  attempts         integer NOT NULL DEFAULT 0,
+  duration_seconds double precision,
+  bytes            bigint,
+  worker           text,
+  error            text,
+  started_at       timestamptz,
+  finished_at      timestamptz,
+  PRIMARY KEY (video_id, kind, tier, chunk)
+);
+
 -- One row per chunk that has landed on disk. Resuming an upload means asking which indexes are missing.
 CREATE TABLE IF NOT EXISTS upload_chunks (
   upload_id uuid NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
